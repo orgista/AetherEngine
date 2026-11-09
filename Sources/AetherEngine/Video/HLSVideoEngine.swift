@@ -762,6 +762,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return capRelaxed ? quarterOfFree : min(cap, quarterOfFree)
     }
 
+    /// Smallest budget a full-volume shrink goes to. Below it the footprint is the window floors
+    /// (`SegmentCache.pressureBackwardKeep` behind, `PrefetchDiskBudget.minAheadSegments` ahead), which no
+    /// budget lowers, so a further shrink could not change what is on disk.
+    static let minimumFullVolumeBudgetBytes = 16 << 20
+
+    /// The volume's free space as reported (`volumeAvailableCapacity`) overstates what the app can write
+    /// on tvOS: DevTV reported 672 MiB free and failed a write with 208 MiB of segments resident. After a
+    /// write fails with ENOSPC the session keeps half of what was on disk at that moment (or of the
+    /// budget, when the window floors already held more than it), until the budget would drop below
+    /// `minimumFullVolumeBudgetBytes` (nil: nothing left to give back).
+    static func budgetAfterFullVolume(currentBudgetBytes: Int, residentBytes: Int) -> Int? {
+        let lowered = min(residentBytes, currentBudgetBytes) / 2
+        guard lowered >= minimumFullVolumeBudgetBytes else { return nil }
+        return lowered
+    }
+
+    /// Applies `budgetAfterFullVolume` to the session, so the next producer parks on the lowered budget,
+    /// and returns it for the caller to hand the cache once `restartLock` is released (the cache evicts
+    /// files). Nil when the budget cannot go lower. Caller holds `restartLock`.
+    func lowerRetentionBudgetAfterFullVolume() -> Int? {
+        guard let cache,
+              let lowered = Self.budgetAfterFullVolume(currentBudgetBytes: retentionBudgetBytes,
+                                                       residentBytes: cache.totalBytes) else { return nil }
+        retentionBudgetBytes = lowered
+        return lowered
+    }
+
     /// Largest forward window the default 2 GiB retention budget covers by construction
     /// (150 segments x ~10 MB for 4K HEVC ~ 1.5 GB), i.e. the old `clampedForwardWindow` ceiling.
     static let defaultRetentionCapWindowCeiling = 150
@@ -874,7 +901,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// (#207, see `PrefetchDiskBudget`). Live resolves the same budget, so the DVR history the
     /// playlist advertises stays resident; the producer-side prefetch park it also feeds is
     /// VOD-only (`advanceMuxer`), so live cannot park on it.
-    private var retentionBudgetBytes: Int = 0
+    private(set) var retentionBudgetBytes: Int = 0
 
     /// Clamp for `forwardWindowSegments`: below 4 the window would undercut AVPlayer's own ~5-7-segment
     /// prefetch and starve it (see `LiveWindowSizing.minSafeSegments`). The 2700 ceiling (~3 h at 4 s

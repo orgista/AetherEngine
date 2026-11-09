@@ -38,17 +38,48 @@ struct SegmentCacheRetentionTests {
         #expect(c.totalBytes == 60)
     }
 
-    @Test("Hard window is never evicted, even when it alone exceeds the budget")
-    func windowSurvivesTinyBudget() {
+    @Test("Over a tiny budget, the window keeps its floor behind the target and everything ahead")
+    func windowFloorSurvivesTinyBudget() {
         let c = SegmentCache(forwardWindow: 2, backwardWindow: 2, retentionBudgetBytes: 30)
         defer { c.close() }
         for i in 0...10 { c.declareTarget(i); c.store(index: i, data: makeData(20)) }
-        // Window [8..10] = 60 B > budget: extras all gone, window fully resident (correctness
-        // beats the budget; the near-behind window covers AVPlayer audio-handover refetches).
-        #expect(c.peek(index: 8) != nil)
+        // Window [8..10] = 60 B > budget: extras all gone, and the window's backward half down to
+        // `pressureBackwardKeep` behind the target; the floor stays even though it still exceeds the budget.
+        #expect(c.peek(index: 8) == nil)
         #expect(c.peek(index: 9) != nil)
         #expect(c.peek(index: 10) != nil)
-        #expect(c.peek(index: 7) == nil)
+    }
+
+    /// DevTV 2026-11-08: the default (10 ahead, 20 behind) window of a 4K remux is ~1 GB, far past a
+    /// nearly full volume. Segments AVPlayer already fetched go first, down to the keep floor.
+    @Test("Over budget, the window's backward half is evicted down to the keep floor")
+    func pressureEvictsTheWindowsBackwardHalf() {
+        let c = SegmentCache(forwardWindow: 10, backwardWindow: 20, retentionBudgetBytes: 100)
+        defer { c.close() }
+        for i in 0...30 { c.declareTarget(i); c.store(index: i, data: makeData(50)) }
+        let floor = 30 - SegmentCache.pressureBackwardKeep
+        #expect(c.peek(index: floor - 1) == nil)
+        #expect(c.peek(index: floor) != nil)
+        #expect(c.peek(index: 30) != nil)
+        #expect(c.totalBytes == (SegmentCache.pressureBackwardKeep + 1) * 50)
+    }
+
+    @Test("Disk pressure never evicts segments at or ahead of the consumer")
+    func pressureKeepsTheForwardHalf() {
+        let c = SegmentCache(forwardWindow: 10, backwardWindow: 20, retentionBudgetBytes: 100)
+        defer { c.close() }
+        c.declareTarget(0)
+        for i in 0...5 { c.store(index: i, data: makeData(50)) }
+        #expect(c.count == 6)
+    }
+
+    @Test("A window that fits the budget keeps its full backward half")
+    func windowWithinBudgetIsUntouched() {
+        let c = SegmentCache(forwardWindow: 10, backwardWindow: 20, retentionBudgetBytes: 10_000)
+        defer { c.close() }
+        for i in 0...30 { c.declareTarget(i); c.store(index: i, data: makeData(50)) }
+        #expect(c.peek(index: 10) != nil)
+        #expect(c.count == 31)
     }
 
     @Test("Zero budget preserves the legacy window-only pruning exactly")

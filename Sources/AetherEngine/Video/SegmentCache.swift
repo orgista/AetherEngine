@@ -41,7 +41,7 @@ final class SegmentCache: @unchecked Sendable {
     /// content is a cache hit and never fires the producer restart that wedges slow sources (#93)
     /// and detaches AVKit's PiP legible renderer (Sodalite#32). 0 = window-only legacy pruning
     /// (live sessions, where the sliding playlist already dropped everything behind the window).
-    private let retentionBudgetBytes: Int
+    private var retentionBudgetBytes: Int
 
     private var entries: [Int: URL] = [:]
     /// Per-index byte ledger for _totalBytes. Stat-on-eviction was wrong when same index was
@@ -367,6 +367,17 @@ final class SegmentCache: @unchecked Sendable {
 
         releaseLiveMarker()
         try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// Lowers the retention budget for the rest of the session (a segment write hit a full volume) and
+    /// evicts down to it at once.
+    func lowerRetentionBudget(to bytes: Int) {
+        condition.lock()
+        retentionBudgetBytes = min(retentionBudgetBytes, bytes)
+        let doomed = pruneOutsideWindow()
+        condition.broadcast()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
     }
 
     // MARK: - Reader side
@@ -738,16 +749,35 @@ final class SegmentCache: @unchecked Sendable {
 
     // MARK: - Internal
 
+    /// Segments behind the consumer's target that survive disk-pressure eviction of the hard window:
+    /// the one AVPlayer may still be reading.
+    static let pressureBackwardKeep = 1
+
+    /// Drops `index` from the ledger and returns its file for deletion after unlock.
+    /// Must be called with condition held.
+    private func evictLocked(_ index: Int, bytes: Int) -> URL? {
+        guard let url = entries.removeValue(forKey: index) else { return nil }
+        _totalBytes -= bytes
+        entryBytes.removeValue(forKey: index)
+        videoReaches.removeValue(forKey: index)
+        return url
+    }
+
     /// Prune to [currentTarget - backwardWindow, max(currentTarget + forwardWindow, highestStoredIndex)].
     /// Must be called with condition held.
     /// hi anchors on highestStoredIndex so a transient backward refetch (AVPlayer audio handover)
     /// doesn't evict already-produced forward segments (repro: seg0..25 produced, refetch seg4 -> target=4
     /// pruned seg15+, stalled when playback reached seg15).
     /// With a retention budget (#93 / Sodalite#32), entries outside that hard window survive,
-    /// nearest-to-target first, while the cache's total footprint fits the budget; the window itself
-    /// is never evicted even when it alone exceeds the budget. Nearest-first eviction from the far
-    /// ends keeps each side of the resident span contiguous, so the provider's residency gate
-    /// (a resident backward target = no producer restart) holds across the whole retained span.
+    /// nearest-to-target first, while the cache's total footprint fits the budget. Nearest-first
+    /// eviction from the far ends keeps each side of the resident span contiguous, so the provider's
+    /// residency gate (a resident backward target = no producer restart) holds across the whole
+    /// retained span.
+    /// When the hard window alone exceeds the budget (a high-bitrate source on a nearly full volume),
+    /// its backward half goes too, oldest first, down to `pressureBackwardKeep` segments behind the
+    /// target: AVPlayer has already fetched them, and keeping them is what fills the volume until a
+    /// segment write fails. A later backward fetch of one re-produces it through the restart path.
+    /// The forward half is never evicted; the producer's disk park bounds it instead.
     private func pruneOutsideWindow() -> [URL] {
         let lo = currentTargetIndex - backwardWindow
         let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
@@ -763,16 +793,21 @@ final class SegmentCache: @unchecked Sendable {
                     keptBytes += bytes
                 }
             }
-            guard !extras.isEmpty else { return [] }
+            if keptBytes > retentionBudgetBytes {
+                let keepFrom = currentTargetIndex - Self.pressureBackwardKeep
+                for k in entries.keys.sorted() where k >= lo && k < keepFrom {
+                    guard keptBytes > retentionBudgetBytes else { break }
+                    let bytes = entryBytes[k] ?? 0
+                    keptBytes -= bytes
+                    if let url = evictLocked(k, bytes: bytes) { doomed.append(url) }
+                }
+            }
+            guard !extras.isEmpty else { return doomed }
             extras.sort { abs($0.index - currentTargetIndex) < abs($1.index - currentTargetIndex) }
             for (k, bytes) in extras {
                 if keptBytes + bytes <= retentionBudgetBytes {
                     keptBytes += bytes
-                } else if let url = entries[k] {
-                    _totalBytes -= bytes
-                    entryBytes.removeValue(forKey: k)
-                    entries.removeValue(forKey: k)
-                    videoReaches.removeValue(forKey: k)
+                } else if let url = evictLocked(k, bytes: bytes) {
                     doomed.append(url)
                 }
             }

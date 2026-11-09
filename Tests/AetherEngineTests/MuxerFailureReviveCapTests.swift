@@ -28,6 +28,16 @@ struct MuxerFailureReviveCapTests {
         }
     }
 
+    private final class KindBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _value: PlaybackErrorKind?
+        var value: PlaybackErrorKind? {
+            lock.lock(); defer { lock.unlock() }
+            return _value
+        }
+        func set(_ kind: PlaybackErrorKind) { lock.lock(); _value = kind; lock.unlock() }
+    }
+
     private func makeEngine() -> HLSVideoEngine {
         HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/witness.mkv"), dvModeAvailable: false)
     }
@@ -46,6 +56,21 @@ struct MuxerFailureReviveCapTests {
         // The reason travels with it: nothing was misread here, the moov could not be written, and a
         // host that reports "read failed" sends the viewer after the wrong thing.
         #expect(failed.reason == "Source audio cannot be muxed")
+    }
+
+    @Test("a full volume surfaces as insufficient storage, not as an unmuxable source")
+    func fullVolumeSurfacesInsufficientStorage() {
+        let engine = makeEngine()
+        engine.muxerFailureReviveGate = MuxerFailureReviveGate(maxAttempts: 0)
+        let failed = Flag()
+        let kind = KindBox()
+        engine.onVODSourceFailed = { code, reason, k in failed.set(code, reason); kind.set(k) }
+
+        engine.handleVODMuxerFailure(writeErrno: ENOSPC)
+
+        #expect(failed.code == -ENOSPC)
+        #expect(failed.reason == "Not enough free storage on this device to play this video")
+        #expect(kind.value == .insufficientStorage)
     }
 
     @Test("a failure inside the cap rebuilds instead of surfacing a terminal error")

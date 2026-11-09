@@ -388,6 +388,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Nil for a stream-copy session, which has no bridge and whose analogous verdict is
     /// `audioMoovPrimeUnobtainable`.
     var audioBridgeFeedStats: AudioBridge.FeedStats? { audioConfig?.bridge?.feedStats }
+    private var _muxerWriteErrno: Int32 = 0
+    /// errno of the staging write behind a failed cut, 0 when none failed. Read by the host after a
+    /// `muxerFailed` exit to tell a full volume from a muxer that cannot take the source.
+    var muxerWriteErrno: Int32 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _muxerWriteErrno
+    }
     private var currentMuxer: MP4SegmentMuxer?
     /// AE#443: totals folded off muxers this producer has ROTATED away. A rotation (program switch, ad
     /// pod, a rebuilt muxer after a failure) hands the session a fresh `ByteCounter`, so a read of the
@@ -1843,24 +1851,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// #207 disk park. The segment window is a sanity bound; the real bound on an opt-in whole-source
     /// prefetch is the session retention budget, which `pruneOutsideWindow` cannot enforce because it
-    /// never evicts the hard window. Parks the pump while the race-ahead has filled that budget AND the
+    /// never evicts the window's forward half. Parks the pump while the race-ahead has filled that budget AND the
     /// consumer still has a safe lead, so the footprint tracks the budget instead of the source length.
-    /// Carries no wedge breaker of its own: the park only ever holds with `PrefetchDiskBudget
-    /// .minAheadSegments` of produced content ahead of the consumer, and the extras eviction that
-    /// follows the advancing playhead releases it. That rests on the advance park having caught a
-    /// consumer that stopped advancing first, so `detectWedge` (#369: the advance park was skipped
-    /// because its release target sat beyond the sequential playlist's frontier) arms the same #65
-    /// detector here. Its cadence matches: this loop polls once a second, like the advance park.
-    /// Returns true on release, false when stop was requested.
-    private func awaitPrefetchDiskBudgetRelease(head: Int, context: String,
-                                                detectWedge: Bool = false) -> Bool {
+    /// The park holds with only `PrefetchDiskBudget.minAheadSegments` of produced content ahead of the
+    /// consumer, closer than the advance park, so on a tight volume it is the first hold a consumer that
+    /// stopped advancing meets (and the only one when #369 skipped the advance park). It therefore arms
+    /// the same #65 detector as the advance park, at the same once-a-second cadence.
+    /// Returns true on release, false when stop was requested or the wedge breaker tripped.
+    private func awaitPrefetchDiskBudgetRelease(head: Int, context: String) -> Bool {
         guard prefetchDiskBudgetBytes > 0 else { return true }
         // #240: same release as the backpressure park; a parked pump is not using the link.
         sideReaderLinkGate?.videoFetchEnded()
         defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
-        var wedgeDetector = detectWedge && !isLive
+        var wedgeDetector = !isLive
             ? BackpressureWedgeDetector(
                 breakThresholdSeconds: Self.backpressureWedgeBreakThresholdSeconds,
                 fastBreakThresholdSeconds: Self.backpressureWedgeFastBreakThresholdSeconds,
@@ -1888,7 +1893,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     "[HLSSegmentProducer] #207 prefetch disk PARK (\(context)) head=\(head) "
                     + "cacheTarget=\(cache.targetIndex) forward=\(cache.forwardBytes / (1 << 20)) MiB "
                     + "budget=\(prefetchDiskBudgetBytes / (1 << 20)) MiB parked=\(parked)s "
-                    + "(opt-in prefetch full; resumes as playback advances)",
+                    + "(disk budget full; resumes as playback advances)",
                     category: .session
                 )
             }
@@ -1902,7 +1907,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     "[HLSSegmentProducer] #369 disk park WEDGE BROKEN (\(context)) head=\(head) "
                     + "cacheTarget=\(cache.targetIndex) parked=\(parked)s"
                     + (wedgeDetector!.lastTripFast ? " (fast path: fetch target + rendered clock both frozen)" : "")
-                    + "; the advance park was skipped, so this park was the last hold. "
+                    + "; this park was the last hold. "
                     + "Exiting pump for host re-anchor on AVPlayer position",
                     category: .session
                 )
@@ -2286,8 +2291,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
             return nil
         case .failed:
             // Failed cut: muxer has no open staging fd, every byte is silently discarded. Fatal.
+            let writeErrno = muxer.writeErrno
+            stateLock.lock()
+            _muxerWriteErrno = writeErrno
+            stateLock.unlock()
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s cut FAILED; "
+                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s cut FAILED "
+                + "(write errno=\(writeErrno), cache=\(cache.totalBytes / (1 << 20)) MiB); "
                 + "muxer is wedged, ending pump",
                 category: .session
             )
@@ -2343,12 +2353,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             } else if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") {
                 return nil
             }
-            // #369 follow-up: a skipped advance park hands the only remaining hold to the disk park,
-            // whose "no wedge breaker needed" rests on the advance park having caught a frozen
-            // consumer first. Carry the detector across, or the pump races to the budget and then
-            // parks there forever on a consumer that will never move again.
-            if !awaitPrefetchDiskBudgetRelease(head: newIdx, context: "advance",
-                                               detectWedge: parkSkipped) { return nil }
+            if !awaitPrefetchDiskBudgetRelease(head: newIdx, context: "advance") { return nil }
         }
         if checkShouldStop() { return nil }
 

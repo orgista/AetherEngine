@@ -228,7 +228,7 @@ extension HLSVideoEngine {
             if isLiveSession {
                 handleLiveMuxerFailure(prod)
             } else {
-                handleVODMuxerFailure()
+                handleVODMuxerFailure(writeErrno: prod.muxerWriteErrno)
             }
             return
         }
@@ -634,13 +634,31 @@ extension HLSVideoEngine {
     /// producer with a fresh muxer and calls audioBridge.startSegment() (which also rebuilds a
     /// post-EOF-drained encoder), so the known transient causes heal. Aimed like the wedge re-anchor:
     /// a pending never-landed seek target owns the recovery aim, else AVPlayer's real position.
-    func handleVODMuxerFailure() {
+    func handleVODMuxerFailure(writeErrno: Int32 = 0) {
+        let volumeFull = writeErrno == ENOSPC || writeErrno == EDQUOT
         restartLock.lock()
-        let admitted = muxerFailureReviveGate.admit()
+        // A full volume that still has budget to give back is revived on the lowered budget without
+        // spending the cap: the cap is for a source that cannot be muxed, and a long film on a tight
+        // Apple TV can hit ENOSPC more than twice while the system's own use of the volume changes.
+        let loweredBudget = volumeFull ? lowerRetentionBudgetAfterFullVolume() : nil
+        let admitted = loweredBudget != nil || muxerFailureReviveGate.admit()
         let attempts = muxerFailureReviveGate.attempts
         let cap = muxerFailureReviveGate.maxAttempts
         restartLock.unlock()
+        if let loweredBudget { cache?.lowerRetentionBudget(to: loweredBudget) }
         guard admitted else {
+            // A full volume is not a source this engine cannot mux: the budget is already at its floor and
+            // the same write failed again. Say what the viewer can act on.
+            if volumeFull {
+                EngineLog.emit(
+                    "[HLSVideoEngine] #99 VOD muxerFailed revive cap reached (\(attempts) failures, cap \(cap)); "
+                    + "giving up (volume full at the minimum disk budget, errno=\(writeErrno))",
+                    category: .session
+                )
+                surfaceVODSourceFailure(-writeErrno, "Not enough free storage on this device to play this video",
+                                        kind: .insufficientStorage)
+                return
+            }
             EngineLog.emit(
                 "[HLSVideoEngine] #99 VOD muxerFailed revive cap reached "
                 + "(\(attempts) failures, cap \(cap)); giving up (source not muxable in this session)",
@@ -679,7 +697,8 @@ extension HLSVideoEngine {
         EngineLog.emit(
             "[HLSVideoEngine] #99 VOD pump died with muxerFailed; rebuilding producer + muxer at "
             + "\(String(format: "%.2f", anchor))s -> seg\(idx) "
-            + "(attempt \(attempts)/\(cap))",
+            + (loweredBudget.map { "(volume full: disk budget lowered to \($0 / (1 << 20)) MiB, cap not spent)" }
+                ?? "(attempt \(attempts)/\(cap))"),
             category: .session
         )
         requestRestart(at: idx, authoritative: true)

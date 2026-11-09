@@ -183,6 +183,11 @@ final class MP4SegmentMuxer {
     }
     /// Latched when the next staging file open fails; producer must stop the pump.
     private(set) var isWedged: Bool = false
+
+    /// errno of the staging write that failed this muxer, 0 when none did. ENOSPC here means the
+    /// segment directory's volume is full, which a rebuilt muxer cannot fix by itself.
+    var writeErrno: Int32 { byteCounter.writeErrno }
+
     /// Latched after avformat_write_header; mp4 muxer rewrites time_base to its own pick
     /// (typically 1/16000 for 24 fps video, 1/<sample rate> for audio).
     private(set) var muxerVideoTimeBase: AVRational = AVRational(num: 1, den: 1)
@@ -270,6 +275,7 @@ final class MP4SegmentMuxer {
                         let err = errno
                         if err == EINTR { continue }
                         counter.writeFailed = true
+                        counter.writeErrno = err
                         return
                     }
                     if n == 0 {
@@ -1108,6 +1114,8 @@ private final class ByteCounter {
     var fd: Int32 = -1
     var bytesWrittenCurrentSegment: Int = 0
     var writeFailed: Bool = false
+    /// errno of the write that set `writeFailed` (0 when the write returned 0 bytes).
+    var writeErrno: Int32 = 0
     var lifetimeFragmentBytes: Int = 0
     var fragmentCuts: Int = 0
 }

@@ -14,10 +14,13 @@ import Foundation
 /// budget instead of the source length. Sessions that never opt in never reach the condition.
 enum PrefetchDiskBudget {
 
-    /// Segments the producer may always run ahead of the consumer, budget or not. Bounding disk closer
-    /// than the historical forward window would starve AVPlayer's own ~5-7-segment prefetch, i.e. trade
-    /// a full volume for a stall. A pathologically small budget therefore loses to playback, by design.
-    static let minAheadSegments = 10
+    /// Segments the producer may always run ahead of the consumer, budget or not. The consumer's target
+    /// is AVPlayer's newest fetch, so this lead sits on top of what AVPlayer already buffered. It used to
+    /// be the historical forward window (10), which made the park unreachable for every default session:
+    /// a 4K remux at ~30-50 MB a segment then wrote ~500 MB ahead on a volume with ~130 MB free, a
+    /// segment write failed with ENOSPC and the session died (DevTV, 2026-11-08). Two keeps one segment
+    /// in production while the next waits, so one slow segment never reaches the player.
+    static let minAheadSegments = 2
 
     /// - Parameters:
     ///   - forwardBytes: on-disk bytes at or above the consumer's target (`SegmentCache.forwardBytes`),

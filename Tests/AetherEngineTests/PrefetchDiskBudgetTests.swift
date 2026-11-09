@@ -62,12 +62,25 @@ struct PrefetchDiskBudgetDecisionTests {
 
     @Test("The park never starves the consumer: a short lead keeps producing")
     func shortLeadKeepsProducing() {
-        // AVPlayer is within the historical 10-segment window of the write head: bounding disk here
-        // would stall playback, which is the failure the whole opt-in exists to avoid.
+        // AVPlayer is within `minAheadSegments` of the write head: bounding disk here would stall
+        // playback.
         #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 5_000, budgetBytes: 1_000,
-                                              head: 100, consumerTarget: 91) == false)
+                                              head: 100, consumerTarget: 99) == false)
         #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 5_000, budgetBytes: 1_000,
-                                              head: 100, consumerTarget: 90) == true)
+                                              head: 100, consumerTarget: 98) == true)
+    }
+
+    /// DevTV 2026-11-08: a 4K remux (~30-50 MB a segment) with ~130 MB free. A default session's
+    /// race-ahead is the 10-segment forward window, so a park that needed a 10-segment lead never held
+    /// and the producer wrote until a segment write failed with ENOSPC.
+    @Test("A default-window session parks before its forward window fills a tight volume")
+    func defaultWindowParksOnATightVolume() {
+        let segment = 40 << 20
+        let budget = HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: 600 << 20)
+        #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 4 * segment, budgetBytes: budget,
+                                              head: 104, consumerTarget: 100) == true)
+        #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 4 * segment, budgetBytes: 2 << 30,
+                                              head: 104, consumerTarget: 100) == false)
     }
 }
 
@@ -123,7 +136,7 @@ struct SegmentCachePrefetchFootprintTests {
         defer { c.close() }
         c.declareTarget(0)
         for i in 0...10 { c.store(index: i, data: makeData(10)) }
-        #expect(c.awaitPrefetchDiskHeadroom(head: 5, budgetBytes: 50, timeout: 0.05) == true)
+        #expect(c.awaitPrefetchDiskHeadroom(head: 1, budgetBytes: 50, timeout: 0.05) == true)
     }
 
     @Test("A session without a budget never withholds headroom")
@@ -156,5 +169,40 @@ struct SegmentCachePrefetchFootprintTests {
         for i in 0...10 { c.declareTarget(i); c.store(index: i, data: makeData(10)) }
         #expect(c.totalBytes == 50)   // budget full of retained history
         #expect(c.awaitPrefetchDiskHeadroom(head: 30, budgetBytes: 50, timeout: 0.05) == true)
+    }
+}
+
+/// DevTV 2026-11-08: tvOS reported 672 MiB free and a segment write still failed with ENOSPC at 208 MiB
+/// resident, so the session gives back half of its footprint after each full-volume failure.
+@Suite("Disk budget after a full volume")
+struct FullVolumeBudgetTests {
+
+    @Test("A full volume halves what was resident")
+    func halvesTheResidentFootprint() {
+        #expect(HLSVideoEngine.budgetAfterFullVolume(currentBudgetBytes: 168 << 20,
+                                                     residentBytes: 208 << 20) == 84 << 20)
+        #expect(HLSVideoEngine.budgetAfterFullVolume(currentBudgetBytes: 168 << 20,
+                                                     residentBytes: 100 << 20) == 50 << 20)
+    }
+
+    @Test("The budget stops shrinking at its floor")
+    func stopsAtTheFloor() {
+        let floor = HLSVideoEngine.minimumFullVolumeBudgetBytes
+        #expect(HLSVideoEngine.budgetAfterFullVolume(currentBudgetBytes: 1 << 30,
+                                                     residentBytes: 2 * floor) == floor)
+        #expect(HLSVideoEngine.budgetAfterFullVolume(currentBudgetBytes: 1 << 30,
+                                                     residentBytes: 2 * floor - 2) == nil)
+    }
+
+    @Test("Lowering the cache budget evicts retained history at once")
+    func cacheEvictsToTheLoweredBudget() {
+        let c = SegmentCache(forwardWindow: 2, backwardWindow: 2, retentionBudgetBytes: 1_000)
+        defer { c.close() }
+        for i in 0...20 { c.declareTarget(i); c.store(index: i, data: Data(repeating: 0xAA, count: 10)) }
+        #expect(c.totalBytes == 210)
+        c.lowerRetentionBudget(to: 50)
+        #expect(c.totalBytes == 50)
+        #expect(c.peek(index: 20) != nil)
+        #expect(c.peek(index: 15) == nil)
     }
 }

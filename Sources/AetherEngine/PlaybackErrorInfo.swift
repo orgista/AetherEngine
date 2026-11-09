@@ -78,6 +78,9 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// command loop, a missing program chain, unreadable title sectors. The disc itself may still play
     /// as `.mainTitle` (Skip to Movie), which is the host's fallback.
     public static let dvdNavigationFailed = PlaybackErrorKind(rawValue: "dvdNavigationFailed")
+    /// The volume holding the session's segment files is full: a segment write failed with ENOSPC or
+    /// EDQUOT on every revive. The source is fine; the device needs free storage before it can play.
+    public static let insufficientStorage = PlaybackErrorKind(rawValue: "insufficientStorage")
 }
 
 /// Machine-readable companion to the text inside `PlaybackState.error` (#376).

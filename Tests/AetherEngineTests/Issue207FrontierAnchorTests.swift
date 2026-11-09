@@ -31,10 +31,12 @@ struct Issue207FrontierAnchorTests {
     func playheadSegmentIsEvictedUnderOptInPrefetch() {
         let c = makeOptInPrefetchCache()
         defer { c.close() }
-        // lo = 30 - 20 = 10, so 0...9 are extras and the kept window is already over budget.
+        // lo = 30 - 20 = 10, so 0...9 are extras, and the kept window is already over budget, so its
+        // backward half goes too, down to the keep floor behind the target.
         #expect(c.peek(index: 0) == nil)
         #expect(c.peek(index: 9) == nil)
-        #expect(c.peek(index: 10) != nil)
+        #expect(c.peek(index: 30 - SegmentCache.pressureBackwardKeep - 1) == nil)
+        #expect(c.peek(index: 30 - SegmentCache.pressureBackwardKeep) != nil)
         #expect(c.peek(index: 40) != nil)
     }
 
