@@ -236,6 +236,7 @@ final class MP4SegmentMuxer {
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
+        makeRoomForWrite: @escaping () -> Bool = { false },
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -274,6 +275,7 @@ final class MP4SegmentMuxer {
                     if n < 0 {
                         let err = errno
                         if err == EINTR { continue }
+                        if err == ENOSPC, makeRoomForWrite() { continue }
                         counter.writeFailed = true
                         counter.writeErrno = err
                         return

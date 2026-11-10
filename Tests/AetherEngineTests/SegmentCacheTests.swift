@@ -7,6 +7,54 @@ struct SegmentCacheTests {
 
     private func makeData(_ n: Int, fill: UInt8 = 0xAA) -> Data { Data(repeating: fill, count: n) }
 
+    @Test("Low-storage VOD keeps one behind and parks at two ahead")
+    func lowStorageWindow() {
+        let cache = SegmentCache(retentionBudgetBytes: 1000, limitsHistoryForStorage: true)
+        defer { cache.close() }
+        for i in 0...5 { cache.declareTarget(i); cache.store(index: i, data: makeData(100)) }
+        #expect(cache.peek(index: 3) == nil)
+        #expect(cache.peek(index: 4) != nil)
+        #expect(cache.peek(index: 5) != nil)
+        #expect(!cache.awaitPrefetchDiskHeadroom(head: 7, budgetBytes: 1000, timeout: 0))
+        cache.declareTarget(6)
+        #expect(cache.awaitPrefetchDiskHeadroom(head: 7, budgetBytes: 1000, timeout: 0))
+    }
+
+    @Test("Disk pressure drops delivered files, preserving mapped reader bytes")
+    func pressureReclaimsConsumedSegments() {
+        let cache = SegmentCache(retentionBudgetBytes: 1000)
+        defer { cache.close() }
+        cache.store(index: 0, data: makeData(100))
+        cache.store(index: 1, data: makeData(100))
+        let reader = cache.peek(index: 0)
+        cache.declareTarget(1)
+        #expect(cache.reclaimForWrite(before: 2))
+        #expect(cache.peek(index: 0) == nil)
+        #expect(reader == makeData(100))
+        #expect(cache.peek(index: 1) != nil)
+        #expect(cache.totalBytes == 100)
+    }
+
+    @Test("A segment that cannot fit with an empty cache reports failure")
+    func pressureCannotReclaimAnEmptyCache() {
+        let cache = SegmentCache()
+        defer { cache.close() }
+        #expect(!cache.reclaimForWrite(before: 0))
+    }
+
+    @Test("Seek discards the old segment band before new production")
+    func seekReclaimsFirst() {
+        let cache = SegmentCache(retentionBudgetBytes: 1000)
+        defer { cache.close() }
+        for i in 0...4 { cache.store(index: i, data: makeData(100)) }
+        cache.discardForSeek(to: 50)
+        #expect(cache.count == 0)
+        #expect(cache.totalBytes == 0)
+        #expect(cache.targetIndex == 50)
+        cache.store(index: 50, data: makeData(100))
+        #expect(cache.peek(index: 50) == makeData(100))
+    }
+
     @Test("store then fetch round-trips; count and totalBytes track")
     func storeFetch() {
         let c = SegmentCache(forwardWindow: 5, backwardWindow: 5)

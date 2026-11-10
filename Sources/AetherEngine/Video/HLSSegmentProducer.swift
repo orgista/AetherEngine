@@ -2013,6 +2013,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 audioDelaySeconds: audioDelaySeconds,
+                makeRoomForWrite: { [weak self] in
+                    guard let self, !self.isLive, !self.checkShouldStop() else { return false }
+                    return self.cache.reclaimForWrite(before: self.currentMuxerSegmentIndex)
+                },
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {

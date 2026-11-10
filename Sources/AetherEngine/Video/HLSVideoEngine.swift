@@ -1348,11 +1348,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .volumeAvailableCapacityForImportantUsage
         #endif
         let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
-        let retentionBudget = Self.sessionRetentionBudgetBytes(volumeAvailableBytes: availableBytes,
+        var retentionBudget = Self.sessionRetentionBudgetBytes(volumeAvailableBytes: availableBytes,
                                                                capRelaxed: capRelaxed)
-        self.retentionBudgetBytes = retentionBudget
+        #if os(tvOS)
+        // tvOS's purgeable capacity is not an app write allowance. Probe the segment volume by writing.
+        let writable = WritableSegmentBudget.probe(in: URL(fileURLWithPath: NSTemporaryDirectory()))
+        retentionBudget = max(1, writable * 3 / 4)
+        let limitsHistoryForStorage = !isLiveSession
+        EngineLog.emit("[HLSVideoEngine] writable probe=\(writable / (1 << 20)) MiB", category: .session)
+        #else
+        let limitsHistoryForStorage = false
+        #endif
         let segmentCache = SegmentCache(forwardWindow: forwardWindowSegments,
-                                        retentionBudgetBytes: retentionBudget)
+                                        retentionBudgetBytes: retentionBudget,
+                                        limitsHistoryForStorage: limitsHistoryForStorage)
+        self.retentionBudgetBytes = retentionBudget
         self.cache = segmentCache
         EngineLog.emit(
             "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
@@ -3482,6 +3492,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // AE#443: off `restartLock`, and before `old.stop()` releases the muxer its byte total is read
         // from.
         retireProducer(old)
+        cache?.discardForSeek(to: idx)
 
         let restartStart = DispatchTime.now()
         func msSince(_ t: DispatchTime) -> Double {

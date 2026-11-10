@@ -35,6 +35,7 @@ final class SegmentCache: @unchecked Sendable {
     /// 20 covers Continuous-Audio handover refetches (~7-10 segments backward); smaller values
     /// cascaded into restart chains that reset the FLAC bridge PTS and caused audible glitches.
     private let backwardWindow: Int
+    private let limitsHistoryForStorage: Bool
     /// Byte budget for retaining segments OUTSIDE the hard window (#93 / Sodalite#32). While the
     /// cache's total footprint fits the budget, already-produced segments beyond the window stay
     /// resident (evicted farthest-from-target first once it fills), so a backward seek into watched
@@ -102,7 +103,8 @@ final class SegmentCache: @unchecked Sendable {
 
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
     init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
-         baseDirectory: URL? = nil) {
+         baseDirectory: URL? = nil, limitsHistoryForStorage: Bool = false) {
+        self.limitsHistoryForStorage = limitsHistoryForStorage
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
         self.retentionBudgetBytes = retentionBudgetBytes
@@ -375,6 +377,36 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         retentionBudgetBytes = min(retentionBudgetBytes, bytes)
         let doomed = pruneOutsideWindow()
+        condition.broadcast()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+    }
+
+    /// Unlinking consumed files leaves AVPlayer's already-mapped response alive.
+    func reclaimForWrite(before head: Int) -> Bool {
+        condition.lock()
+        var doomed: [URL] = []
+        for index in entries.keys.sorted() where index < currentTargetIndex {
+            if let url = evictLocked(index, bytes: entryBytes[index] ?? 0) { doomed.append(url) }
+        }
+        let canWait = entries.keys.contains { $0 < head }
+        if doomed.isEmpty && canWait { _ = condition.wait(until: Date().addingTimeInterval(1)) }
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        return !doomed.isEmpty || canWait
+    }
+
+    func discardForSeek(to index: Int) {
+        condition.lock()
+        let doomed = Array(entries.values)
+        entries.removeAll()
+        entryBytes.removeAll()
+        videoReaches.removeAll()
+        _totalBytes = 0
+        _highestStoredIndex = -1
+        currentTargetIndex = index
+        fetchFloor = index
+        fetchFront = index
         condition.broadcast()
         condition.unlock()
         for url in doomed { try? FileManager.default.removeItem(at: url) }
@@ -734,7 +766,14 @@ final class SegmentCache: @unchecked Sendable {
 
     /// Must be called with condition held.
     private func shouldParkLocked(head: Int, budgetBytes: Int) -> Bool {
-        PrefetchDiskBudget.shouldPark(forwardBytes: currentForwardBytes(),
+        if limitsHistoryForStorage, retentionBudgetBytes > 0, retentionBudgetBytes < 256 << 20,
+           head > currentTargetIndex {
+            let target = currentTargetIndex >= 0 ? currentTargetIndex : (entries.keys.min() ?? head)
+            if head - target >= 2 { return true }
+            let reserve = entryBytes.values.max() ?? 0
+            if entries[target] != nil, currentForwardBytes() + reserve > retentionBudgetBytes { return true }
+        }
+        return PrefetchDiskBudget.shouldPark(forwardBytes: currentForwardBytes(),
                                       budgetBytes: budgetBytes,
                                       head: head,
                                       consumerTarget: currentTargetIndex)
@@ -779,7 +818,8 @@ final class SegmentCache: @unchecked Sendable {
     /// segment write fails. A later backward fetch of one re-produces it through the restart path.
     /// The forward half is never evicted; the producer's disk park bounds it instead.
     private func pruneOutsideWindow() -> [URL] {
-        let lo = currentTargetIndex - backwardWindow
+        let pressureWindow = limitsHistoryForStorage && retentionBudgetBytes > 0 && retentionBudgetBytes < 256 << 20
+        let lo = currentTargetIndex - (pressureWindow ? Self.pressureBackwardKeep : backwardWindow)
         let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
         var doomed: [URL] = []
         if retentionBudgetBytes > 0 {
@@ -792,6 +832,12 @@ final class SegmentCache: @unchecked Sendable {
                 } else {
                     keptBytes += bytes
                 }
+            }
+            if pressureWindow {
+                for extra in extras where extra.index < lo {
+                    if let url = evictLocked(extra.index, bytes: extra.bytes) { doomed.append(url) }
+                }
+                extras.removeAll { $0.index < lo }
             }
             if keptBytes > retentionBudgetBytes {
                 let keepFrom = currentTargetIndex - Self.pressureBackwardKeep
