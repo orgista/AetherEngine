@@ -2,7 +2,9 @@ import Darwin
 import Foundation
 
 enum WritableSegmentBudget {
-    static func probe(in directory: URL, limit: Int = 256 << 20) -> Int {
+    // DevTV takes nearly three seconds to write 256 MiB. A bounded write proves a startup allowance;
+    // the producer reclaims consumed files if a larger segment needs more.
+    static func probe(in directory: URL, limit: Int = 32 << 20) -> Int {
         let path = directory.appendingPathComponent("writable-probe-" + UUID().uuidString)
         let fd = open(path.path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
         guard fd >= 0 else { return 0 }

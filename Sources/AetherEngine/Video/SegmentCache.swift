@@ -84,6 +84,7 @@ final class SegmentCache: @unchecked Sendable {
     private static let liveMarkerName = "session.lock"
 
     private var _totalBytes: Int = 0
+    private var pressureReclaimDeadline = Date.distantPast
 
     /// Monotonic across prunes; NOT decremented by pruneOutsideWindow. Lets VideoSegmentProvider
     /// detect gaps below the producer's write head after eviction erases them from indexRange().
@@ -383,22 +384,27 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     /// Unlinking consumed files leaves AVPlayer's already-mapped response alive.
-    func reclaimForWrite(before head: Int) -> Bool {
+    func reclaimForWrite(before head: Int, timeout: TimeInterval = 0.1) -> Bool {
         condition.lock()
         var doomed: [URL] = []
         for index in entries.keys.sorted() where index < currentTargetIndex {
             if let url = evictLocked(index, bytes: entryBytes[index] ?? 0) { doomed.append(url) }
         }
+        if !doomed.isEmpty { pressureReclaimDeadline = Date().addingTimeInterval(2) }
         let canWait = entries.keys.contains { $0 < head }
-        if doomed.isEmpty && canWait { _ = condition.wait(until: Date().addingTimeInterval(1)) }
+        let mappedResponseIsReleasing = Date() < pressureReclaimDeadline
+        if doomed.isEmpty && (canWait || mappedResponseIsReleasing) {
+            _ = condition.wait(until: Date().addingTimeInterval(timeout))
+        }
         condition.unlock()
         for url in doomed { try? FileManager.default.removeItem(at: url) }
-        return !doomed.isEmpty || canWait
+        return !doomed.isEmpty || canWait || mappedResponseIsReleasing
     }
 
     func discardForSeek(to index: Int) {
         condition.lock()
         let doomed = Array(entries.values)
+        if !doomed.isEmpty { pressureReclaimDeadline = Date().addingTimeInterval(2) }
         entries.removeAll()
         entryBytes.removeAll()
         videoReaches.removeAll()

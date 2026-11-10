@@ -20,6 +20,19 @@ struct SegmentCacheTests {
         #expect(cache.awaitPrefetchDiskHeadroom(head: 7, budgetBytes: 1000, timeout: 0))
     }
 
+    @Test("Pressure waits for an unlinked mapped response to release its blocks")
+    func pressureAllowsMappedDeliveryToFinish() {
+        let cache = SegmentCache()
+        defer { cache.close() }
+        cache.store(index: 0, data: makeData(100))
+        let response = cache.peek(index: 0)
+        cache.declareTarget(1)
+        #expect(cache.reclaimForWrite(before: 1, timeout: 0))
+        #expect(cache.count == 0)
+        #expect(cache.reclaimForWrite(before: 1, timeout: 0))
+        #expect(response == makeData(100))
+    }
+
     @Test("Disk pressure drops delivered files, preserving mapped reader bytes")
     func pressureReclaimsConsumedSegments() {
         let cache = SegmentCache(retentionBudgetBytes: 1000)

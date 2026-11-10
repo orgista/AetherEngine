@@ -103,11 +103,12 @@ struct ServedFromMemoryProgressTests {
 
         // The parse's return to the head, repeatedly. Every one of these is a memcpy out of bytes
         // fetched during open.
-        let requestsBefore = server.requestLog.count
+        // A refused frontier refill may finish concurrently; only a request below it would refetch the head.
+        let requestsBefore = server.requestLog.filter { $0.start < frontier }.count
         for step in 0..<16 {
             #expect(Self.readOnce(reader, at: Int64(step) * 64 * 1024, bytes: 32 * 1024) > 0)
         }
-        #expect(server.requestLog.count == requestsBefore,
+        #expect(server.requestLog.filter { $0.start < frontier }.count == requestsBefore,
                 "the run must come out of the retained head: \(server.requestLog.suffix(4))")
         #expect(reader.rateLimitStreakForTesting >= charged,
                 "a span serve costs no request and must not clear the ladder")
