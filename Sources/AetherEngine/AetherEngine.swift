@@ -5876,7 +5876,7 @@ public final class AetherEngine: ObservableObject {
         // session-preserving reload runs through stopInternal too; clearing would re-pay the pass on
         // every audio switch. A new item invalidates it in startAtmosConfirmation().
         cancelAtmosConfirmation()
-        // markClosed() aborts a probe blocked in avformat_open_input/find_stream_info (lock-free, idempotent).
+        // markClosed() aborts a probe blocked in avformat_open_input/find_stream_info (idempotent).
         inFlightProbeDemuxer?.markClosed()
         liveTelemetrySampler?.stop()
         liveTelemetrySampler = nil

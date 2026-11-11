@@ -193,7 +193,17 @@ public final class Demuxer: @unchecked Sendable {
     // concurrent access triggers assertion failures in matroskadec.c.
     private let accessLock = NSLock()
 
-    private var avioProvider: AVIOProvider?
+    private struct ProviderState {
+        var provider: AVIOProvider?
+        var cancelled = false
+    }
+    // Separate from accessLock: cancellation must reach a provider blocked in open().
+    private let providerLock = NSLock()
+    private var providerState = ProviderState()
+    private var avioProvider: AVIOProvider? {
+        get { providerLock.withLock { providerState.provider } }
+        set { providerLock.withLock { providerState.provider = newValue } }
+    }
     private var openProfile: DemuxerOpenProfile = .playback
 
     /// #409: rewrites the timestamps of an MP4 whose writer dropped the composition-offset table.
@@ -485,8 +495,22 @@ public final class Demuxer: @unchecked Sendable {
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
         isLive: Bool = false
     ) throws {
-        try provider.open()
-        avioProvider = provider
+        try providerLock.withLock {
+            guard !providerState.cancelled else { throw CancellationError() }
+            providerState.provider = provider
+        }
+        do {
+            try provider.open()
+        } catch {
+            provider.close()
+            avioProvider = nil
+            throw error
+        }
+        guard !providerLock.withLock({ providerState.cancelled }) else {
+            provider.close()
+            avioProvider = nil
+            throw CancellationError()
+        }
         onOpenProgress?(.sourceOpened)   // #361
 
         guard let ctx = avformat_alloc_context() else {
@@ -1858,14 +1882,18 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.endReadDeadline()
     }
 
-    /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns
+    /// Fast unblock: AVIO read callback returns -1, av_read_frame returns
     /// at once. No resource freeing. Call before close() when cancelling a pump.
     func markClosed() {
-        avioProvider?.markClosed()
+        let provider = providerLock.withLock {
+            providerState.cancelled = true
+            return providerState.provider
+        }
+        provider?.markClosed()
     }
 
     func close() {
-        avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
+        markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
         dvdTitleReader = nil
         if formatContext != nil {
