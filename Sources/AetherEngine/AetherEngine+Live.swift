@@ -40,8 +40,22 @@ extension AetherEngine {
         liveWindowTimerTask = Task { [weak self, weak host] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled else { return }
                 guard let self, let host else { return }
                 guard self.isLive else { continue }
+                do {
+                    let outputSeconds = self.renderedPositionMirror.get() + self.liveItemAxisOffsetSeconds
+                    if let url = try self.nativeVideoSession?.rotateLivePlaylistIfNeeded(
+                        atOutputSeconds: outputSeconds) {
+                        self.nativeVideoSession?.armLiveRejoinStart(atOutputSeconds: outputSeconds)
+                        host.swapItem(url: url, startPosition: nil, skipInitialSeek: true)
+                        if self.playIntentMirror.get() { host.play() }
+                    }
+                } catch {
+                    EngineLog.emit("[AetherEngine] live playlist rejoin could not start: \(error)",
+                                   category: .session)
+                    self.nativeVideoSession?.onLiveSourceReset?()
+                }
                 self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
             }
         }

@@ -755,18 +755,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// safe (see BackpressureWedgeDetector.fastBreakThresholdSeconds).
     private static let backpressureWedgeFastBreakThresholdSeconds = 5
 
-    /// Live disk runaway FLOOR for awaitLiveWindowHeadroom, for a session that cannot state its own
-    /// window (`liveResidentCapProvider` unset). The live cap is `max(this, provider())`, and the
-    /// provider's value is the sliding window plus slack, so the park always sits ABOVE the window.
-    ///
-    /// AE#443: this used to be the cap itself, and the claim above it was that a session could only
-    /// approach it with a dead consumer. That was false for any window deeper than 180 segments: the
-    /// playlist does not start sliding until `windowSegmentCount` segments exist, so the cache fills to
-    /// the cap first and the pump parks there for the rest of the session. Measured on the loopback
-    /// fixture at an 1800 s window and a 1 s cadence, an edge session with no seek at all: park at
-    /// resident=180 after 179 s, never released, the edge frozen from that second on. The reporter of
-    /// #443 measured the same shape against Jellyfin at a 3.9 s cadence, and 180 x 3.9 s is where his
-    /// session froze, three campaigns running.
+    /// Fallback for callers without a session-specific storage cap.
     private static let liveResidentSegmentCap = 180
 
     static func qosName(_ c: qos_class_t) -> String {
@@ -1787,24 +1776,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return false
     }
 
-    /// Live replacement for the advance-path backpressure park (#65). Live production is source-paced,
-    /// so overproduction is bounded by the origin's real-time delivery; the only unbounded case is a
-    /// consumer that stopped polling entirely, which this cap catches. Logs from the first cycle (the
-    /// old live park was silent below 12 s, which is why consumer-facing 6-8 s freezes never showed a
-    /// producer-side line). Returns true on release, false when stop was requested.
-    ///
-    /// What makes this safe against a held blocking reload is the HEIGHT of the cap, not the release
-    /// path. A parked pump finalizes no segment, so `segments.count` stops growing, so the playlist
-    /// window stops sliding and `notePlaylistBuild -> evictBelow` evicts nothing: while the park holds,
-    /// the only thing that lowers `cache.count` is `pruneOutsideWindow` off a consumer segment GET
-    /// (`declareTarget`), structurally the same release the #65 park waited on. The deadlock is out of
-    /// reach only because reaching `liveResidentSegmentCap` takes a consumer that is already dead, and
-    /// the engine's 12 s stall watchdogs reload the item (and thus issue a fresh GET) long before then.
-    /// Lowering the cap toward the steady-state window would put that deadlock back within reach.
-    /// AE#443: the resident count this pump refuses to pass. The session states it (window plus
-    /// slack); the static floor only covers a session that cannot.
+    /// The session's cap allows one timer tick to attach a fresh item before the consumer is evicted.
     private func liveResidentCap() -> Int {
-        max(Self.liveResidentSegmentCap, liveResidentCapProvider?() ?? 0)
+        liveResidentCapProvider?() ?? Self.liveResidentSegmentCap
     }
 
     private func awaitLiveWindowHeadroom(head: Int) -> Bool {

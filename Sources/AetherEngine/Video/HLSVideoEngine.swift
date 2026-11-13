@@ -1831,16 +1831,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.provider = prov
         if isLiveSession {
-            prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds, discontinuous in
-                prov?.appendLiveSegment(index: index,
-                                        startSeconds: startPtsSeconds,
-                                        durationSeconds: durationSeconds,
-                                        discontinuous: discontinuous)
+            prod.onLiveSegmentFinalized = { [weak self] index, durationSeconds, startPtsSeconds, discontinuous in
+                guard let self else { return }
+                self.restartLock.lock()
+                self.provider?.appendLiveSegment(index: index,
+                                                 startSeconds: startPtsSeconds,
+                                                 durationSeconds: durationSeconds,
+                                                 discontinuous: discontinuous)
+                self.restartLock.unlock()
             }
             // AE#443: the runaway park has to sit above the window this session actually serves, or it
             // bounds the window instead of backstopping it, and its enforcement (a sleeping read
             // thread) stops the origin from being drained.
-            prod.liveResidentCapProvider = { [weak prov] in prov?.liveResidentParkCap() ?? 0 }
+            prod.liveResidentCapProvider = { [weak self] in
+                guard let self else { return LiveWindowSizing.maxWindowSegments }
+                self.restartLock.lock()
+                let provider = self.provider
+                self.restartLock.unlock()
+                return provider?.liveResidentParkCap() ?? LiveWindowSizing.maxWindowSegments
+            }
         } else if sequentialOrigin {
             prod.onSequentialSegmentFinalized = { [weak prov] index, durationSeconds in
                 prov?.appendSequentialSegmentDuration(index: index, durationSeconds: durationSeconds)
@@ -2021,6 +2030,30 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Internal on purpose: it feeds the engine's own AirPlay routing, and hosts read the consequence
     /// (`AetherEngine.nativeSubtitleRenditionsServed`) rather than the input.
     private(set) var servedSourceIsHDR: Bool = false
+
+    private var retiredLiveServer: HLSLocalServer?
+
+    /// New port, new media-playlist identity; the old provider stops before its first invalid EXTINF.
+    func rotateLivePlaylistIfNeeded(atOutputSeconds seconds: Double) throws -> URL? {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        provider?.noteLivePlayhead(atOutputSeconds: seconds)
+        if let provider, provider.mediaFetchCount > 0 {
+            retiredLiveServer?.stop()
+            retiredLiveServer = nil
+        }
+        guard retiredLiveServer == nil else { return nil }
+        guard let successor = provider?.liveSuccessorIfNeeded() else { return nil }
+        let replacement = HLSLocalServer(provider: successor)
+        try replacement.start()
+        retiredLiveServer?.stop()
+        retiredLiveServer = server
+        provider = successor
+        server = replacement
+        EngineLog.emit("[HLSVideoEngine] live playlist contract rejoin: fresh loopback URL",
+                       category: .session)
+        return servingMasterPlaylist ? replacement.playlistURL : replacement.mediaPlaylistURL
+    }
 
     /// The loopback server's media (single-variant) playlist URL, for the reactive master->media
     /// fallback (#98). Nil before the server starts.
@@ -2294,6 +2327,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         producer = nil
         let s = server
         server = nil
+        let retiredServer = retiredLiveServer
+        retiredLiveServer = nil
         let c = cache
         cache = nil
         let ab = audioBridge
@@ -2342,6 +2377,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         Task.detached {
             _ = p?.waitForFinish(timeout: 3.0)
             s?.stop()
+            retiredServer?.stop()
             c?.close()
             ab?.close()
             d?.close()

@@ -762,6 +762,9 @@ final class HLSLocalServer: @unchecked Sendable {
         case "/media.m3u8":
             // For live: hold until at least one segment exists (-12888 fires immediately on empty live playlist; AVPlayer never re-polls).
             if let p = provider, p.playlistType == .live {
+                guard p.waitForFirstLiveSegment(timeout: 30.0) else {
+                    return send503(fd: fd, path: normalizedPath, reason: "live GOP not ready")
+                }
                 if let msn = Self.parseHLSMsn(query) {
                     // LL-HLS blocking reload: hold until segment msn is cut so AVPlayer receives it the instant it exists, not a reload-interval late. Gated on liveBlockingReloadEnabled: bursty ingest sources can't honor the contract and withheld it.
                     if p.liveBlockingReloadEnabled {
@@ -774,8 +777,6 @@ final class HLSLocalServer: @unchecked Sendable {
                                            reason: "blocking reload msn=\(msn) unsatisfiable")
                         }
                     }
-                } else {
-                    _ = p.waitForFirstLiveSegment(timeout: 30.0)
                 }
             } else if let p = provider, p.playlistType == .event {
                 // Sequential append playlist: hold until the startup segments exist. A fast
@@ -809,6 +810,10 @@ final class HLSLocalServer: @unchecked Sendable {
             // #15: windowed subtitle media playlist, one WebVTT segment per video segment.
             guard let parsed = Self.parseSubsPath(p), let prov = provider else {
                 return send404(fd: fd, path: normalizedPath, reason: "unparseable subtitle playlist path")
+            }
+            if prov.playlistType == .live,
+               !prov.waitForFirstLiveSegment(timeout: 30.0) {
+                return send503(fd: fd, path: normalizedPath, reason: "live GOP not ready")
             }
             EngineLog.emit("[HLSLocalServer] subtitle rendition selected: subs_\(parsed.ordinal).m3u8 fetched", category: .hlsServer)
             let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: parsed.ordinal, provider: prov)
@@ -1317,6 +1322,9 @@ final class HLSLocalServer: @unchecked Sendable {
     static func buildSubtitleMediaPlaylistText(ordinal: Int, provider: HLSSegmentProvider) -> String {
         let snapshot = provider.notePlaylistBuild()
         let count = snapshot.visibleCount
+        if provider.playlistType == .live && count < LiveEdgePolicy.minStartupSegments {
+            return "#EXTM3U\n"
+        }
         let firstVisible = min(snapshot.firstVisible, count)
 
         // Sodalite#32: whole-program shape, ONE VOD segment spanning the full duration, one .vtt with all cues.
@@ -1408,6 +1416,9 @@ final class HLSLocalServer: @unchecked Sendable {
         // Atomic snapshot from notePlaylistBuild(); a separate lock acquisition for visibleCount vs firstVisible let a concurrent window slide produce a trapping range.
         let snapshot = provider.notePlaylistBuild()
         let count = snapshot.visibleCount
+        if provider.playlistType == .live && count < LiveEdgePolicy.minStartupSegments {
+            return "#EXTM3U\n"
+        }
         let firstVisible = min(snapshot.firstVisible, count)
         let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
         // AE#446 round 2: a live source that has stopped delivering, with a consumer still holding

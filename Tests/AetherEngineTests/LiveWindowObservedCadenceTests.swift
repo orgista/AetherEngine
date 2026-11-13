@@ -36,7 +36,7 @@ final class LiveWindowObservedCadenceTests: XCTestCase {
     // MARK: - Provider window slide
 
     func testPlaylistSlidesAtObservedCadenceNotCutTarget() {
-        let provider = makeFastZapProvider()
+        let provider = makeFastZapProvider(consumerTarget: 34)
         // 35 finalized 2s segments: observed mean = 2.0 -> window 30 -> firstVisible = 35 - 30 = 5.
         // Pre-fix the window was 120 and firstVisible stayed 0 for four minutes of content.
         for i in 0..<35 {
@@ -61,6 +61,8 @@ final class LiveWindowObservedCadenceTests: XCTestCase {
         let provider = makeFastZapProvider()
         // Unsealed: legacy 18s (3 x fallback TD 6) so non-live/test conformers keep today's bound.
         XCTAssertEqual(provider.liveBlockingReloadHoldSeconds, 18.0, accuracy: 0.001)
+        provider.appendLiveSegment(index: 0, startSeconds: 0, durationSeconds: 0.5)
+        provider.appendLiveSegment(index: 1, startSeconds: 0.5, durationSeconds: 1.92)
         // Seal at fastZap cadence: max segment 1.92s -> TD=2 -> hold 6s.
         XCTAssertEqual(provider.liveTargetDurationSeconds(maxSegmentDuration: 1.92), 2)
         XCTAssertEqual(provider.liveBlockingReloadHoldSeconds, 6.0, accuracy: 0.001)
@@ -71,9 +73,11 @@ final class LiveWindowObservedCadenceTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeFastZapProvider() -> VideoSegmentProvider {
-        VideoSegmentProvider(
-            cache: SegmentCache(forwardWindow: 10, backwardWindow: 10),
+    private func makeFastZapProvider(consumerTarget: Int? = nil) -> VideoSegmentProvider {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        if let consumerTarget { cache.declareTarget(consumerTarget) }
+        return VideoSegmentProvider(
+            cache: cache,
             segments: [],
             codecsString: "avc1.640029,mp4a.40.2",
             supplementalCodecs: nil,

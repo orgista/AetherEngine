@@ -111,13 +111,13 @@ struct Issue446StatedItemAxisTests {
     @Test("an ordinary live build states the axis it is placing the item on")
     func ordinaryLiveBuildStatesTheAxis() {
         let provider = makeLiveProvider()
-        // 2 s cadence, 60 s window -> 30 segments visible, so 35 produced slides to firstVisible 5.
+        // Before the first fetch the consumer still needs segment zero, even after the window fills.
         fill(provider, count: 35)
         provider.armLiveItemAxisStatement()
         let playlist = HLSLocalServer.buildMediaPlaylistText(provider: provider)
-        #expect(playlist.contains("#EXT-X-MEDIA-SEQUENCE:5"))
+        #expect(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0"))
         // The same fact the tag carries by index, in the seconds it stands for.
-        #expect(provider.servedLiveItemAxisOutputSeconds == 10.0)
+        #expect(provider.servedLiveItemAxisOutputSeconds == 0.0)
     }
 
     /// A window whose source has stopped is served as a finished asset (round 2), and an item that

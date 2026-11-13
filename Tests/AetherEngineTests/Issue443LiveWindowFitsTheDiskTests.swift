@@ -87,22 +87,4 @@ struct Issue443LiveWindowFitsTheDiskTests {
                 == LiveWindowSizing.maxWindowSegments)
     }
 
-    @Test("the shape that parked now resolves below the count the pump refuses to pass")
-    func theReportersShapeNoLongerMeetsTheCap() {
-        // The defect in arithmetic. The pump's static floor is 180 segments; the reporter's session
-        // asked for 462 and would therefore fill to 180 and park there, 702 s in, which is where his
-        // edge froze. Clamped to what the disk holds, the window resolves to 292 and the pump's cap
-        // for that session is the window plus slack, so the two can no longer meet in normal play.
-        let sizing = LiveWindowSizing(targetSegmentDurationSeconds: 0.5, dvrWindowSeconds: 1800,
-                                      retentionBudgetBytes: budget2GiB)
-        let asked = sizing.windowSegmentCount(observedSegmentDurationSeconds: 3.9)
-        let served = sizing.windowSegmentCount(observedSegmentDurationSeconds: 3.9,
-                                               observedSegmentBytes: 7 << 20)
-        #expect(asked > 180)      // fills to the floor and parks
-        #expect(served > 180)     // still deeper than the floor, so the cap has to follow the window
-        #expect(served + VideoSegmentProvider.liveResidentParkSlackSegments > served)
-        // And the slack has to be real: a park one poll's worth of segments above the window would be
-        // met by a consumer that is merely a poll behind.
-        #expect(VideoSegmentProvider.liveResidentParkSlackSegments >= 8)
-    }
 }
