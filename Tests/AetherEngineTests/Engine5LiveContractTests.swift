@@ -181,4 +181,22 @@ struct Engine5LiveContractTests {
         #expect(cache.peekURL(index: 7) != nil)
     }
 
+    @Test func fullCacheReclaimsFetchedPrefixWithoutReplacingAHealthyItem() {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10,
+                                 retentionBudgetBytes: 8_000)
+        defer { cache.close() }
+        let subject = provider(cache: cache, budget: 8_000)
+        for index in 0..<8 {
+            cache.store(index: index, data: Data(repeating: 0, count: 1_000))
+            subject.appendLiveSegment(index: index, startSeconds: Double(index) * 2,
+                                      durationSeconds: 2)
+        }
+        cache.declareTarget(6)
+        subject.noteLivePlayhead(atOutputSeconds: 10)
+        #expect(subject.liveSuccessorIfNeeded() == nil)
+        #expect(cache.count <= 6)
+        #expect(subject.notePlaylistBuild().firstVisible <= 4)
+        #expect(cache.peekURL(index: 5) != nil)
+    }
+
 }

@@ -801,17 +801,36 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let bytes = cache.meanEntryBytes
         let consumer = cache.targetIndex
         let residentCount = cache.count
+        var reclaimedFloor: Int?
         stateLock.lock()
-        defer { stateLock.unlock() }
+        defer {
+            stateLock.unlock()
+            if let reclaimedFloor { cache.evictBelow(reclaimedFloor) }
+        }
         guard isLive, !liveRetired else { return nil }
-        let cap = min(LiveWindowSizing.maxWindowSegments,
+        let cap = max(1, min(LiveWindowSizing.maxWindowSegments,
                       LiveWindowSizing.affordableSegments(
                         retentionBudgetBytes: liveWindowSizing.retentionBudgetBytes,
-                        observedSegmentBytes: bytes))
+                        observedSegmentBytes: bytes)))
         let retainedFloor = consumer >= liveMinimumConsumerIndex
             ? max(_liveFirstVisible, max(0, consumer - 1)) : _liveFirstVisible
-        let atCapacity = segments.count - retainedFloor >= max(1, cap - 1)
+        var atCapacity = segments.count - retainedFloor >= max(1, cap - 1)
             || residentCount >= max(1, cap - 1)
+        if atCapacity {
+            let consumerFloor = consumer >= liveMinimumConsumerIndex
+                ? max(0, consumer - 1) : _liveFirstVisible
+            let protectedFloor = min(consumerFloor,
+                                     livePlayheadIndex.map { max(0, $0 - 1) } ?? consumerFloor)
+            let neededFloor = max(_liveFirstVisible, segments.count - max(1, cap - 2))
+            if neededFloor <= protectedFloor {
+                for segment in segments[_liveFirstVisible..<neededFloor] where segment.discontinuous {
+                    _discontinuitySequence += 1
+                }
+                _liveFirstVisible = neededFloor
+                reclaimedFloor = neededFloor
+                atCapacity = false
+            }
+        }
         guard livePublishedCountLimit != nil || atCapacity else { return nil }
         let successor = VideoSegmentProvider(
             cache: cache, segments: segments, codecsString: codecsString,
