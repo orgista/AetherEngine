@@ -120,6 +120,11 @@ struct Engine5LiveContractTests {
         let successor = try #require(subject.liveSuccessorIfNeeded())
         let snapshot = successor.notePlaylistBuild()
         #expect(snapshot.visibleCount - snapshot.firstVisible <= 8)
+        #expect(snapshot.visibleCount - snapshot.firstVisible <= 4)
+        cache.declareTarget(snapshot.firstVisible + 1)
+        successor.completeLiveHandoff()
+        #expect(cache.count <= 4)
+        #expect(successor.liveSuccessorIfNeeded() == nil)
         #expect(subject.notePlaylistBuild().firstVisible <= 3)
     }
 

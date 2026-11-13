@@ -2039,8 +2039,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         defer { restartLock.unlock() }
         provider?.noteLivePlayhead(atOutputSeconds: seconds)
         if let provider, provider.mediaFetchCount > 0 {
-            retiredLiveServer?.stop()
-            retiredLiveServer = nil
+            if retiredLiveServer != nil {
+                retiredLiveServer?.stop()
+                retiredLiveServer = nil
+                provider.completeLiveHandoff()
+            }
         }
         guard retiredLiveServer == nil else { return nil }
         guard let successor = provider?.liveSuccessorIfNeeded() else { return nil }

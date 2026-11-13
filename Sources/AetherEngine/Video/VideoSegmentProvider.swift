@@ -835,7 +835,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let window = liveWindowSizing.windowSegmentCount(
             observedSegmentDurationSeconds: mean, observedSegmentBytes: bytes)
         successor._liveFirstVisible = atCapacity
-            ? max(_liveFirstVisible, segments.count - min(window, max(1, cap - 2)))
+            ? max(_liveFirstVisible, segments.count - min(window, max(1, cap / 2)))
             : _liveFirstVisible
         successor.livePlayheadIndex = atCapacity ? nil : livePlayheadIndex
         successor.liveMinimumConsumerIndex = successor._liveFirstVisible
@@ -845,6 +845,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                                       _liveFirstVisible + max(1, cap))
         liveRetired = true
         return successor
+    }
+
+    /// Called after the successor has served media and the old item/server is retired.
+    func completeLiveHandoff() {
+        stateLock.lock()
+        let floor = _liveFirstVisible
+        stateLock.unlock()
+        cache.evictBelow(floor)
     }
 
     /// AE#441 round 3: what a window slide costs is decided by the consumer's NEXT fetch, not its last.
