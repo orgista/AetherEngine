@@ -475,6 +475,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private var liveMinimumConsumerIndex = 0
     private var liveMaximumSegmentDuration: Double
     private var livePlayheadIndex: Int?
+    /// Where the consumer's fetch point and rendered segment stood when a full cache last saw either
+    /// move, and when. Cleared once the cache has room. See `liveSuccessorIfNeeded`.
+    private var _liveCapacityProgress: (consumer: Int, playhead: Int?, at: TimeInterval)?
+    private var _loggedLiveCapacityHold = false
     /// AE#446: wall time of the newest finalized live segment, and the latch that says the source
     /// stopped delivering. See `liveDeliveryStalled`.
     private var _lastLiveSegmentFinalizedAt: Date?
@@ -796,16 +800,33 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
     }
 
+    /// How long a full cache waits for the consumer to fetch or render another segment before the item
+    /// is replaced. Longer than any live target duration, so a consumer that is draining a backlog in
+    /// real time always moves within it; a paused or wedged one does not.
+    static let liveCapacityStallSeconds: TimeInterval = 8
+
     /// The old URL keeps its target duration and tail while a fresh server attaches its successor.
-    func liveSuccessorIfNeeded() -> VideoSegmentProvider? {
+    ///
+    /// A full cache alone does not replace the item. The provider's start burst (tens of segments in a
+    /// few seconds) fills a small allowance (tvOS: 24 MiB) while the consumer is still near its start,
+    /// and every segment from there to the head is one it has not rendered. The window cannot drop them,
+    /// so the producer parks and the prefix the consumer passes is reclaimed here on each tick, keeping
+    /// the URL. Only a consumer that stops moving for `liveCapacityStallSeconds` gets a fresh item.
+    func liveSuccessorIfNeeded(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> VideoSegmentProvider? {
         let bytes = cache.meanEntryBytes
         let consumer = cache.targetIndex
         let residentCount = cache.count
         var reclaimedFloor: Int?
+        var logsHold = false
         stateLock.lock()
         defer {
             stateLock.unlock()
             if let reclaimedFloor { cache.evictBelow(reclaimedFloor) }
+            if logsHold {
+                EngineLog.emit("[HLSVideoEngine] live cache full while the consumer drains a backlog: "
+                               + "keeping the item, reclaiming behind the consumer (logged once per item)",
+                               category: .session)
+            }
         }
         guard isLive, !liveRetired else { return nil }
         let cap = max(1, min(LiveWindowSizing.maxWindowSegments,
@@ -822,13 +843,24 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             let protectedFloor = min(consumerFloor,
                                      livePlayheadIndex.map { max(0, $0 - 1) } ?? consumerFloor)
             let neededFloor = max(_liveFirstVisible, segments.count - max(1, cap - 2))
-            if neededFloor <= protectedFloor {
-                for segment in segments[_liveFirstVisible..<neededFloor] where segment.discontinuous {
+            let floor = min(neededFloor, protectedFloor)
+            if floor > _liveFirstVisible {
+                for segment in segments[_liveFirstVisible..<floor] where segment.discontinuous {
                     _discontinuitySequence += 1
                 }
-                _liveFirstVisible = neededFloor
-                reclaimedFloor = neededFloor
-                atCapacity = false
+                _liveFirstVisible = floor
+                reclaimedFloor = floor
+            }
+            atCapacity = neededFloor > protectedFloor
+        }
+        if !atCapacity { _liveCapacityProgress = nil }
+        if atCapacity, livePublishedCountLimit == nil {
+            let moved = _liveCapacityProgress.map { $0.consumer != consumer || $0.playhead != livePlayheadIndex } ?? true
+            if moved { _liveCapacityProgress = (consumer, livePlayheadIndex, now) }
+            if let progress = _liveCapacityProgress, now - progress.at < Self.liveCapacityStallSeconds {
+                logsHold = !_loggedLiveCapacityHold
+                _loggedLiveCapacityHold = true
+                return nil
             }
         }
         guard livePublishedCountLimit != nil || atCapacity else { return nil }

@@ -95,9 +95,11 @@ struct Engine5LiveContractTests {
                                       durationSeconds: 2)
         }
         #expect(subject.notePlaylistBuild().firstVisible <= 3)
-        #expect(subject.liveSuccessorIfNeeded() == nil)
+        #expect(subject.liveSuccessorIfNeeded(now: 0) == nil)
         subject.appendLiveSegment(index: 899, startSeconds: 1798, durationSeconds: 2)
-        let successor = try #require(subject.liveSuccessorIfNeeded())
+        #expect(subject.liveSuccessorIfNeeded(now: 0) == nil)
+        let successor = try #require(subject.liveSuccessorIfNeeded(
+            now: VideoSegmentProvider.liveCapacityStallSeconds))
         let snapshot = successor.notePlaylistBuild()
         #expect(snapshot.visibleCount - snapshot.firstVisible <= LiveWindowSizing.maxWindowSegments)
         #expect(snapshot.firstVisible > 3)
@@ -117,7 +119,9 @@ struct Engine5LiveContractTests {
         }
         #expect(cache.totalBytes <= 8_000)
         #expect(subject.liveResidentParkCap() == 8)
-        let successor = try #require(subject.liveSuccessorIfNeeded())
+        #expect(subject.liveSuccessorIfNeeded(now: 0) == nil)
+        let successor = try #require(subject.liveSuccessorIfNeeded(
+            now: VideoSegmentProvider.liveCapacityStallSeconds))
         let snapshot = successor.notePlaylistBuild()
         #expect(snapshot.visibleCount - snapshot.firstVisible <= 8)
         #expect(snapshot.visibleCount - snapshot.firstVisible <= 4)
@@ -197,6 +201,61 @@ struct Engine5LiveContractTests {
         #expect(cache.count <= 6)
         #expect(subject.notePlaylistBuild().firstVisible <= 4)
         #expect(cache.peekURL(index: 5) != nil)
+    }
+
+    /// tvOS live start: the provider hands over ~40 segments at once against a 24 MiB allowance.
+    /// The consumer drains them in real time; the item must keep its URL the whole way.
+    @Test func startBurstDrainsOnTheSameItemWithinTheAllowance() {
+        let budget = 24 << 20
+        let segmentBytes = 1 << 20
+        let burst = 40
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10, retentionBudgetBytes: budget)
+        defer { cache.close() }
+        let subject = provider(cache: cache, budget: budget)
+        var produced = 0
+        func produce() {
+            while produced < burst, cache.count < subject.liveResidentParkCap() {
+                cache.store(index: produced, data: Data(repeating: 0, count: segmentBytes))
+                subject.appendLiveSegment(index: produced, startSeconds: Double(produced),
+                                          durationSeconds: 1)
+                produced += 1
+            }
+        }
+        produce()
+        var rotations = 0
+        var lostSegments: [Int] = []
+        var peakBytes = cache.totalBytes
+        for consumer in 0..<burst {
+            #expect(consumer < produced)
+            if cache.peekURL(index: consumer) == nil { lostSegments.append(consumer) }
+            cache.declareTarget(consumer)
+            subject.noteLivePlayhead(atOutputSeconds: Double(consumer) + 0.5)
+            let snapshot = subject.notePlaylistBuild()
+            #expect(snapshot.firstVisible <= consumer)
+            if subject.liveSuccessorIfNeeded() != nil { rotations += 1 }
+            produce()
+            peakBytes = max(peakBytes, cache.totalBytes)
+        }
+        #expect(produced == burst)
+        #expect(rotations == 0)
+        #expect(lostSegments.isEmpty)
+        #expect(peakBytes <= budget)
+    }
+
+    @Test func fullCacheBehindAStoppedConsumerStillRejoins() throws {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10,
+                                 retentionBudgetBytes: 8_000)
+        defer { cache.close() }
+        let subject = provider(cache: cache, budget: 8_000)
+        cache.declareTarget(2)
+        for index in 0..<8 {
+            cache.store(index: index, data: Data(repeating: 0, count: 1_000))
+            subject.appendLiveSegment(index: index, startSeconds: Double(index) * 2,
+                                      durationSeconds: 2)
+        }
+        #expect(subject.liveSuccessorIfNeeded(now: 100) == nil)
+        #expect(subject.liveSuccessorIfNeeded(now: 100 + VideoSegmentProvider.liveCapacityStallSeconds - 1) == nil)
+        _ = try #require(subject.liveSuccessorIfNeeded(now: 100 + VideoSegmentProvider.liveCapacityStallSeconds))
     }
 
 }
