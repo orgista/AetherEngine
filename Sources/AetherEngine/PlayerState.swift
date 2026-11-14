@@ -396,6 +396,10 @@ public struct LoadOptions: Sendable, Equatable {
     /// never starvation, which is why cutting it short cost nothing. Cold joins were identical in both
     /// arms, the guards keeping the lever out of the starved case as designed. Set `false` to keep
     /// AVPlayer's own policy for the join.
+    ///
+    /// The same flag arms a second, separate cut: in the first 10 s after the item rolls, a wait for the
+    /// `EvaluatingBufferingRate` reason over at least 3 s of buffer is cut short too (at most three times
+    /// per load). See `NativeAVPlayerHost.shouldCutEarlyRateEvaluation`.
     public var liveJoinStartsImmediately: Bool = true
 
     /// Whether `play()` may move a behind-live playhead by itself. Default `true`, which is the historical

@@ -85,6 +85,14 @@ final class NativeAVPlayerHost {
     /// its own. Both spend it, and the witness has to name which, because "the wait ended without the
     /// buffer reaching the floor" is the opposite of what happened when the override cut it.
     private var liveJoinImmediateStartCutShort: Bool = false
+    /// When this live load first rolled. Opens the window in which an early rate evaluation over a deep
+    /// buffer is cut short (`cutEarlyRateEvaluationIfDeep`).
+    private var liveFirstRollAt: DispatchTime?
+    /// Early rate evaluations cut short on this load, bounded by `maximumEarlyRateEvaluationCuts`.
+    private var liveEarlyEvaluationCuts: Int = 0
+    private var liveEarlyEvaluationProbeInFlight: Bool = false
+    /// Keeps the "left an early evaluation alone" line to one per load.
+    private var liveEarlyEvaluationRefusalLogged: Bool = false
     /// AE#443: what the items this host has already retired transferred, so `rx` keeps describing the
     /// SESSION across an item swap the session survives.
     ///
@@ -425,6 +433,10 @@ final class NativeAVPlayerHost {
         // at all and read the previous join's spend reason.
         self.liveJoinHoldWitnessStarted = false
         self.liveJoinImmediateStartCutShort = false
+        self.liveFirstRollAt = nil
+        self.liveEarlyEvaluationCuts = 0
+        self.liveEarlyEvaluationProbeInFlight = false
+        self.liveEarlyEvaluationRefusalLogged = false
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
@@ -635,6 +647,7 @@ final class NativeAVPlayerHost {
             guard let reason = player.reasonForWaitingToPlay?.rawValue else { return }
             Task { @MainActor in
                 self?.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
+                self?.cutEarlyRateEvaluationIfDeep(waitingReason: reason)
             }
         }
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
@@ -655,6 +668,10 @@ final class NativeAVPlayerHost {
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
+                if status == .playing, self.isLiveSession, self.liveFirstRollAt == nil {
+                    self.liveFirstRollAt = DispatchTime.now()
+                }
+                self.cutEarlyRateEvaluationIfDeep(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
                 if status == .playing { self.hasEverPlayed = true }
                 if status == .playing, !self.didSampleSettledRoute {
@@ -1261,6 +1278,90 @@ final class NativeAVPlayerHost {
                 "[NativeAVPlayerHost] #\(self.sessionID) AE#440 live join: cutting the stall-avoidance "
                 + "wait short at rate \(rate) (buffer ahead "
                 + String(format: "%.2f", reading.aheadSeconds) + "s)",
+                category: .engine
+            )
+            self.avPlayer.playImmediately(atRate: rate)
+        }
+    }
+
+    /// Whether an early rate evaluation should be cut short now.
+    ///
+    /// After a live item rolls, AVPlayer sometimes stops again within seconds to re-estimate its buffering
+    /// rate (`AVPlayerWaitingWhileEvaluatingBufferingRateReason`), holding a still picture for up to
+    /// 0.74 s with 4.1 to 5.9 s already buffered ahead (walk 24 on an Apple TV 4K: 7 of 29 starts). A
+    /// source delivered at 1x cannot change that estimate quickly, so the wait buys nothing over a deep
+    /// buffer. Only inside the first `earlyRateEvaluationWindow` seconds of the load, at most
+    /// `maximumEarlyRateEvaluationCuts` times, and only over `minimumEarlyEvaluationBufferAhead` seconds
+    /// of contiguous, non-empty buffer; a thin buffer and every later wait keep AVPlayer's own policy.
+    nonisolated static func shouldCutEarlyRateEvaluation(
+        armed: Bool,
+        hostWantsToPlay: Bool,
+        isEvaluatingBufferingRate: Bool,
+        secondsSinceFirstRoll: Double?,
+        cutsSoFar: Int,
+        playbackBufferEmpty: Bool,
+        bufferedAheadSeconds: Double
+    ) -> Bool {
+        guard armed, hostWantsToPlay, isEvaluatingBufferingRate else { return false }
+        guard let since = secondsSinceFirstRoll, since <= earlyRateEvaluationWindow else { return false }
+        guard cutsSoFar < maximumEarlyRateEvaluationCuts, !playbackBufferEmpty else { return false }
+        guard bufferedAheadSeconds.isFinite else { return false }
+        return bufferedAheadSeconds >= minimumEarlyEvaluationBufferAhead
+    }
+
+    nonisolated static let earlyRateEvaluationWindow: Double = 10
+    nonisolated static let maximumEarlyRateEvaluationCuts = 3
+    /// Twice the join floor: the walk-24 waits all sat over 4 s, and a cushion this deep outlasts any
+    /// single late segment of the 2 to 3 s GOPs these live sources are cut at.
+    nonisolated static let minimumEarlyEvaluationBufferAhead: Double = 3.0
+
+    private func cutEarlyRateEvaluationIfDeep(waitingReason: String) {
+        let evaluating = AVPlayer.WaitingReason.evaluatingBufferingRate.rawValue
+        guard liveJoinStartsImmediately, playIntent,
+              let firstRoll = liveFirstRollAt,
+              timeControlStatus == .waitingToPlayAtSpecifiedRate,
+              waitingReason == evaluating,
+              liveEarlyEvaluationCuts < Self.maximumEarlyRateEvaluationCuts,
+              !liveEarlyEvaluationProbeInFlight,
+              let item = playerItem
+        else { return }
+        liveEarlyEvaluationProbeInFlight = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.liveEarlyEvaluationProbeInFlight = false }
+            let reading = await Self.liveJoinBufferReading(item)
+            // The reading is async; most of these waits end inside it, and those need nothing.
+            guard self.playerItem === item,
+                  self.timeControlStatus == .waitingToPlayAtSpecifiedRate,
+                  self.avPlayer.reasonForWaitingToPlay?.rawValue == evaluating
+            else { return }
+            let since = Self.secondsSince(firstRoll)
+            guard Self.shouldCutEarlyRateEvaluation(
+                armed: self.liveJoinStartsImmediately,
+                hostWantsToPlay: self.playIntent,
+                isEvaluatingBufferingRate: true,
+                secondsSinceFirstRoll: since,
+                cutsSoFar: self.liveEarlyEvaluationCuts,
+                playbackBufferEmpty: reading.bufferEmpty,
+                bufferedAheadSeconds: reading.aheadSeconds
+            ) else {
+                if !self.liveEarlyEvaluationRefusalLogged {
+                    self.liveEarlyEvaluationRefusalLogged = true
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(self.sessionID) early rate evaluation left alone at t+"
+                        + String(format: "%.2f", since) + "s after the first roll (buffer ahead "
+                        + String(format: "%.2f", reading.aheadSeconds) + "s, empty=\(reading.bufferEmpty))",
+                        category: .engine
+                    )
+                }
+                return
+            }
+            self.liveEarlyEvaluationCuts += 1
+            let rate = self.avPlayer.defaultRate != 0 ? self.avPlayer.defaultRate : 1.0
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(self.sessionID) early rate evaluation cut short at t+"
+                + String(format: "%.2f", since) + "s after the first roll (buffer ahead "
+                + String(format: "%.2f", reading.aheadSeconds) + "s, cut \(self.liveEarlyEvaluationCuts))",
                 category: .engine
             )
             self.avPlayer.playImmediately(atRate: rate)
