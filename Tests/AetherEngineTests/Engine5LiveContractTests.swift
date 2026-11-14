@@ -287,4 +287,19 @@ struct Engine5LiveContractTests {
         #expect(parked.liveOutageEndlist == false)
     }
 
+    /// AVPlayer sends no segment request while a blocking reload is held, so holding one for the head
+    /// while the producer is parked on a full cache starves a consumer with segments resident ahead.
+    @Test func blockingReloadIsNotHeldWhileTheProducerIsParked() {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        defer { cache.close() }
+        let subject = provider(cache: cache)
+        for index in 0..<4 {
+            subject.appendLiveSegment(index: index, startSeconds: Double(index) * 0.9, durationSeconds: 0.9)
+        }
+        subject.noteLiveHeadroomPark(true)
+        let started = Date()
+        #expect(subject.waitForLiveSegment(index: 4, timeout: 3) == false)
+        #expect(Date().timeIntervalSince(started) < 0.5)
+    }
+
 }

@@ -1698,6 +1698,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
     }
 
+    var liveHeadroomParked: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _liveHeadroomParkedSince != nil
+    }
+
     /// AE#446 round 2: serve the remaining window as a finished asset while the source is not delivering.
     ///
     /// A live playlist whose tail stops moving stops being fetched, and the segments it still lists go
@@ -2232,6 +2238,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             if available.count > index { return true }
             // A retired URL cannot satisfy a reload for a segment reserved for its successor.
             if available.closed { return false }
+            // Nor can a producer parked on a full cache, and AVPlayer fetches no segment while the
+            // reload is held, so the consumer could never free the room the park is waiting for.
+            if liveHeadroomParked { return false }
             // AE#446: wake in slices rather than parking for the whole bound. A source that stops
             // delivering mid-hold has to be noticed here too, or the poll that was already in flight
             // when it died still costs the client a full 3 x TARGETDURATION of not fetching anything.
