@@ -138,6 +138,15 @@ enum LiveEdgePolicy {
         Int(servedSeconds(seconds).rounded(.up))
     }
 
+    /// Whether a segment may join a playlist already serving `targetDuration`. RFC 8216 §4.3.3.1 asks
+    /// only that the EXTINF, rounded to the nearest integer, not exceed TARGETDURATION. The seal rounds
+    /// up because it is chosen once and has to cover what is still to come; a served contract is broken
+    /// only by a segment the RFC itself rules out. A 29.97 fps source with 2 s GOPs cuts 2.002 s
+    /// segments, and rounding those up replaced the item seconds into almost every such start.
+    static func segmentFitsTargetDuration(_ seconds: Double, targetDuration: Int) -> Bool {
+        servedSeconds(seconds).rounded(.toNearestOrAwayFromZero) <= Double(targetDuration)
+    }
+
     /// AE#454: the served `EXT-X-START:TIME-OFFSET` for a rejoin, or nil when this playlist cannot
     /// carry the placement.
     ///
@@ -302,6 +311,12 @@ struct LiveTargetDurationDerivation {
     let cutTargetFloor: Double?
     let cadenceFloor: CadenceFloorTerm
     let selfReported: Double?
+
+    /// The value without the EXTINF term: what the cut target and the measured cadence alone require.
+    var floorsOnlyValue: Int {
+        LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 0, cutTargetSeconds: cutTargetFloor,
+                                             cadenceFloorSeconds: cadenceFloor.seconds)
+    }
 
     /// One line, in the order the terms are maxed. Reads as an argument for the number it reports.
     var account: String {
@@ -635,8 +650,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             )
             return
         }
-        if let sealed = liveTargetDurationSeal.value,
-           derivation.value > sealed, livePublishedCountLimit == nil {
+        if let sealed = liveTargetDurationSeal.value, livePublishedCountLimit == nil,
+           derivation.floorsOnlyValue > sealed
+            || !LiveEdgePolicy.segmentFitsTargetDuration(durationSeconds, targetDuration: sealed) {
             livePublishedCountLimit = index
         }
         // source TB not reachable here; DVR restart machinery will supply correct values when wired

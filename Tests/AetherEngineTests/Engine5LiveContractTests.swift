@@ -49,6 +49,43 @@ struct Engine5LiveContractTests {
         #expect(subject.waitForLiveSegment(index: 4, timeout: 0) == false)
     }
 
+    /// 29.97 fps with 2 s GOPs: the first GOPs seal TD 2, then a 60-frame GOP of 2.002 s arrives in the
+    /// start burst. Rounded to the nearest second it is 2 (RFC 8216 §4.3.3.1), so the item stays.
+    @Test func aSegmentThatRoundsToTheTargetStaysOnTheSameItem() {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        defer { cache.close() }
+        let subject = provider(cache: cache)
+        for index in 0..<4 {
+            subject.appendLiveSegment(index: index, startSeconds: Double(index) * 1.919, durationSeconds: 1.919)
+        }
+        #expect(target(HLSLocalServer.buildMediaPlaylistText(provider: subject)) == 2)
+        subject.appendLiveSegment(index: 4, startSeconds: 7.676, durationSeconds: 2.002)
+        subject.appendLiveSegment(index: 5, startSeconds: 9.678, durationSeconds: 2.499)
+        let next = HLSLocalServer.buildMediaPlaylistText(provider: subject)
+        #expect(target(next) == 2)
+        #expect(next.contains("#EXTINF:2.002"))
+        #expect(next.contains("#EXTINF:2.499"))
+        #expect(subject.waitForLiveSegment(index: 5, timeout: 0))
+        #expect(subject.liveSuccessorIfNeeded() == nil)
+    }
+
+    @Test func aSegmentThatRoundsPastTheTargetStillGetsANewItem() throws {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        defer { cache.close() }
+        let subject = provider(cache: cache)
+        for index in 0..<4 {
+            subject.appendLiveSegment(index: index, startSeconds: Double(index) * 1.919, durationSeconds: 1.919)
+        }
+        _ = HLSLocalServer.buildMediaPlaylistText(provider: subject)
+        subject.appendLiveSegment(index: 4, startSeconds: 7.676, durationSeconds: 2.5)
+        let next = HLSLocalServer.buildMediaPlaylistText(provider: subject)
+        #expect(target(next) == 2)
+        #expect(next.contains("#EXTINF:2.500") == false)
+        #expect(subject.waitForLiveSegment(index: 4, timeout: 0) == false)
+        let successor = try #require(subject.liveSuccessorIfNeeded())
+        #expect(target(HLSLocalServer.buildMediaPlaylistText(provider: successor)) == 3)
+    }
+
     @Test(arguments: [(37, 2, 3), (73, 38, 39)])
     func windowRetainsTheNextUnfetchedSegment(sample: (Int, Int, Int)) {
         let (total, consumer, nextNeeded) = sample
