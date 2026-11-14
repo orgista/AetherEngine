@@ -1850,6 +1850,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 self.restartLock.unlock()
                 return provider?.liveResidentParkCap() ?? LiveWindowSizing.maxWindowSegments
             }
+            prod.onLiveHeadroomPark = { [weak self] parked in
+                guard let self else { return }
+                self.restartLock.lock()
+                let provider = self.provider
+                self.restartLock.unlock()
+                provider?.noteLiveHeadroomPark(parked)
+            }
         } else if sequentialOrigin {
             prod.onSequentialSegmentFinalized = { [weak prov] index, durationSeconds in
                 prov?.appendSequentialSegmentDuration(index: index, durationSeconds: durationSeconds)

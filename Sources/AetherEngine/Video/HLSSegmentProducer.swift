@@ -203,6 +203,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// pre-#443 behaviour.
     var liveResidentCapProvider: (@Sendable () -> Int)?
 
+    /// Fires on the pump thread as the live headroom park begins (true) and ends (false).
+    var onLiveHeadroomPark: (@Sendable (Bool) -> Void)?
+
     /// Sequential-VOD twin of `onLiveSegmentFinalized` (index, real duration in seconds): feeds
     /// the append playlist whose EXTINF must match the media actually muxed. Set only for
     /// sequential-origin sessions; nil keeps the historical VOD behavior byte-identical.
@@ -582,6 +585,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         parkStateLock.lock()
         _liveHeadroomParked = parked
         parkStateLock.unlock()
+        onLiveHeadroomPark?(parked)
     }
     private let noCutWatchdogQueue = DispatchQueue(label: "aether.nocut.watchdog", qos: .userInitiated)
     /// Tick of the lifted watchdog: fine against both windows (10 s wedge, 35 s starvation) and

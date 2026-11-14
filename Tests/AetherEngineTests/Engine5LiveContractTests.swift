@@ -258,4 +258,33 @@ struct Engine5LiveContractTests {
         _ = try #require(subject.liveSuccessorIfNeeded(now: 100 + VideoSegmentProvider.liveCapacityStallSeconds))
     }
 
+    /// A pump parked on a full cache finalizes nothing; that must not read as the source going quiet
+    /// (AE#446 would close the window with ENDLIST and swap the item, a rebuffer on a healthy channel).
+    @Test func headroomParkDoesNotReadAsASourceOutage() {
+        let now = Date()
+        func provider(parkedFor park: TimeInterval?) -> (VideoSegmentProvider, SegmentCache) {
+            let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+            let subject = self.provider(cache: cache)
+            for index in 0..<4 {
+                subject.appendLiveSegment(index: index, startSeconds: Double(index) * 0.9, durationSeconds: 0.9,
+                                          finalizedAt: now.addingTimeInterval(-10))
+            }
+            cache.declareTarget(1)
+            if let park { subject.noteLiveHeadroomPark(true, at: now.addingTimeInterval(-park)) }
+            _ = HLSLocalServer.buildMediaPlaylistText(provider: subject)
+            return (subject, cache)
+        }
+        let (quiet, quietCache) = provider(parkedFor: nil)
+        defer { quietCache.close() }
+        #expect(quiet.liveDeliveryStalled)
+
+        let (parked, parkedCache) = provider(parkedFor: 9.5)
+        defer { parkedCache.close() }
+        #expect(parked.liveDeliveryStalled == false)
+        #expect(parked.liveOutageEndlist == false)
+        parked.noteLiveHeadroomPark(false, at: now)
+        #expect(parked.liveDeliveryStalled == false)
+        #expect(parked.liveOutageEndlist == false)
+    }
+
 }

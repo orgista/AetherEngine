@@ -482,6 +482,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#446: wall time of the newest finalized live segment, and the latch that says the source
     /// stopped delivering. See `liveDeliveryStalled`.
     private var _lastLiveSegmentFinalizedAt: Date?
+    /// When the producer's headroom park began, while it lasts. See `noteLiveHeadroomPark`.
+    private var _liveHeadroomParkedSince: Date?
     private var _liveDeliveryStalledLatched = false
     /// AE#446 round 2: once ENDLIST has been served it can never be withdrawn to the item that saw it,
     /// so the decision latches. See `liveOutageEndlist`.
@@ -621,7 +623,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// Append a finalized live segment. Index must equal segments.count; out-of-order ignored.
     func appendLiveSegment(index: Int, startSeconds: Double, durationSeconds: Double,
-                           discontinuous: Bool = false) {
+                           discontinuous: Bool = false, finalizedAt: Date = Date()) {
         let derivation = currentLiveTargetDuration(maxSegmentDuration: durationSeconds)
         stateLock.lock()
         guard index == segments.count else {
@@ -648,7 +650,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             discontinuous: discontinuous
         ))
         liveMaximumSegmentDuration = max(liveMaximumSegmentDuration, durationSeconds)
-        _lastLiveSegmentFinalizedAt = Date()
+        _lastLiveSegmentFinalizedAt = finalizedAt
         _liveRecentDurations.append(durationSeconds)
         if _liveRecentDurations.count > Self.liveRecentDurationSampleCount {
             _liveRecentDurations.removeFirst(_liveRecentDurations.count - Self.liveRecentDurationSampleCount)
@@ -881,6 +883,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             segmentPlacedHandler: segmentPlacedHandler, segmentServedHandler: segmentServedHandler)
         successor._liveRecentDurations = _liveRecentDurations
         successor._lastLiveSegmentFinalizedAt = _lastLiveSegmentFinalizedAt
+        successor._liveHeadroomParkedSince = _liveHeadroomParkedSince
         let mean = _liveRecentDurations.isEmpty ? nil
             : _liveRecentDurations.reduce(0, +) / Double(_liveRecentDurations.count)
         let window = liveWindowSizing.windowSegmentCount(
@@ -1657,7 +1660,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             stateLock.unlock()
             return true
         }
-        guard isLive, let last = _lastLiveSegmentFinalizedAt,
+        guard isLive, _liveHeadroomParkedSince == nil, let last = _lastLiveSegmentFinalizedAt,
               let targetDuration = liveTargetDurationSeal.value else {
             stateLock.unlock()
             return false
@@ -1676,6 +1679,23 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             category: .session
         )
         return true
+    }
+
+    /// The producer parks while the cache is full, and a parked pump finalizes nothing however well the
+    /// source is delivering, so the AE#446 delivery clock stops for the park: the source is not judged
+    /// late while it lasts, and its length is credited to the last finalize when it ends.
+    func noteLiveHeadroomPark(_ parked: Bool, at now: Date = Date()) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if parked {
+            if _liveHeadroomParkedSince == nil { _liveHeadroomParkedSince = now }
+            return
+        }
+        guard let since = _liveHeadroomParkedSince else { return }
+        _liveHeadroomParkedSince = nil
+        if let last = _lastLiveSegmentFinalizedAt {
+            _lastLiveSegmentFinalizedAt = min(now, last.addingTimeInterval(now.timeIntervalSince(since)))
+        }
     }
 
     /// AE#446 round 2: serve the remaining window as a finished asset while the source is not delivering.
@@ -1754,8 +1774,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// returning CAN-BLOCK-RELOAD would flap). A window closed by an outage has to be able to re-open,
     /// so the condition that closes it has to be able to become false again. Call under stateLock.
     private func sourceIsLateLocked() -> Bool {
-        guard let last = _lastLiveSegmentFinalizedAt, let td = liveTargetDurationSeal.value,
-              td > 0 else { return false }
+        guard _liveHeadroomParkedSince == nil, let last = _lastLiveSegmentFinalizedAt,
+              let td = liveTargetDurationSeal.value, td > 0 else { return false }
         return Date().timeIntervalSince(last) > 1.5 * Double(td)
     }
 
