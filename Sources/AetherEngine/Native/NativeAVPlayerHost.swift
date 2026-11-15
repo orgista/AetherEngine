@@ -93,6 +93,13 @@ final class NativeAVPlayerHost {
     private var liveEarlyEvaluationProbeInFlight: Bool = false
     /// Keeps the "left an early evaluation alone" line to one per load.
     private var liveEarlyEvaluationRefusalLogged: Bool = false
+    /// Keeps the "the evaluation ended before the reading came back" line to one per load.
+    private var liveEarlyEvaluationRaceLogged: Bool = false
+    /// True while `automaticallyWaitsToMinimizeStalling` is off for the early window after a live roll
+    /// (`holdStallAvoidanceOffAfterFirstRoll`). The player is reused across loads, so every path that
+    /// ends the window puts the policy back.
+    private var earlyStallAvoidanceOff: Bool = false
+    private var earlyStallAvoidanceGuard: Task<Void, Never>?
     /// AE#443: what the items this host has already retired transferred, so `rx` keeps describing the
     /// SESSION across an item swap the session survives.
     ///
@@ -437,6 +444,7 @@ final class NativeAVPlayerHost {
         self.liveEarlyEvaluationCuts = 0
         self.liveEarlyEvaluationProbeInFlight = false
         self.liveEarlyEvaluationRefusalLogged = false
+        self.liveEarlyEvaluationRaceLogged = false
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
@@ -670,6 +678,7 @@ final class NativeAVPlayerHost {
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 if status == .playing, self.isLiveSession, self.liveFirstRollAt == nil {
                     self.liveFirstRollAt = DispatchTime.now()
+                    self.holdStallAvoidanceOffAfterFirstRoll()
                 }
                 self.cutEarlyRateEvaluationIfDeep(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
@@ -774,6 +783,7 @@ final class NativeAVPlayerHost {
             // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
             MainActor.assumeIsolated {
                 self?.stallCount += 1
+                self?.restoreStallAvoidance(because: "the item stalled", resume: true)
             }
         }
         notificationObservers.append(stalledObs)
@@ -1315,6 +1325,91 @@ final class NativeAVPlayerHost {
     /// single late segment of the 2 to 3 s GOPs these live sources are cut at.
     nonisolated static let minimumEarlyEvaluationBufferAhead: Double = 3.0
 
+    /// Whether AVPlayer's stall avoidance may stay off in the early window after a live roll.
+    ///
+    /// The cut above acts after an evaluation has begun, so the picture has already frozen, and its
+    /// buffer reading comes back after most of those waits are over: walk 26 (DevTV, b20r44) still had
+    /// 7 of 38 starts wait, all `EvaluatingBufferingRate`, up to 0.74 s at 5.75 s ahead, with no cut.
+    /// That reason only exists while `automaticallyWaitsToMinimizeStalling` is on, so the window turns
+    /// the policy off instead and puts it back the moment it could matter. It goes off at the roll
+    /// (AVPlayer has just judged the item likely to keep up) and stays off only over
+    /// `minimumEarlyEvaluationBufferAhead` of contiguous, non-empty buffer at the first reading, then
+    /// over `minimumLiveJoinBufferAhead` at every later one, inside `earlyRateEvaluationWindow`, while
+    /// the host wants to play. Restoring well before the buffer is empty is what keeps this clear of
+    /// 35fa16d0's failure: a stall with the policy off is the shape that parks the rate at 0.
+    nonisolated static func shouldHoldStallAvoidanceOff(
+        secondsSinceFirstRoll: Double,
+        hostWantsToPlay: Bool,
+        isFirstReading: Bool,
+        playbackBufferEmpty: Bool,
+        bufferedAheadSeconds: Double
+    ) -> Bool {
+        guard hostWantsToPlay, secondsSinceFirstRoll <= earlyRateEvaluationWindow else { return false }
+        guard !playbackBufferEmpty, bufferedAheadSeconds.isFinite else { return false }
+        let floor = isFirstReading ? minimumEarlyEvaluationBufferAhead : minimumLiveJoinBufferAhead
+        return bufferedAheadSeconds >= floor
+    }
+
+    nonisolated static let earlyStallAvoidanceReadingInterval: Duration = .milliseconds(250)
+
+    private func holdStallAvoidanceOffAfterFirstRoll() {
+        guard liveJoinStartsImmediately, playIntent, !earlyStallAvoidanceOff,
+              let firstRoll = liveFirstRollAt, let item = playerItem
+        else { return }
+        avPlayer.automaticallyWaitsToMinimizeStalling = false
+        earlyStallAvoidanceOff = true
+        earlyStallAvoidanceGuard = Task { @MainActor [weak self] in
+            var isFirstReading = true
+            while !Task.isCancelled {
+                guard let self, self.earlyStallAvoidanceOff, self.playerItem === item else { return }
+                let reading = await Self.liveJoinBufferReading(item)
+                guard !Task.isCancelled, self.earlyStallAvoidanceOff, self.playerItem === item else { return }
+                let since = Self.secondsSince(firstRoll)
+                let ahead = String(format: "%.2f", reading.aheadSeconds)
+                guard Self.shouldHoldStallAvoidanceOff(
+                    secondsSinceFirstRoll: since,
+                    hostWantsToPlay: self.playIntent,
+                    isFirstReading: isFirstReading,
+                    playbackBufferEmpty: reading.bufferEmpty,
+                    bufferedAheadSeconds: reading.aheadSeconds
+                ) else {
+                    let why = since > Self.earlyRateEvaluationWindow
+                        ? "the window is over (buffer ahead \(ahead)s)"
+                        : "buffer ahead \(ahead)s, empty=\(reading.bufferEmpty)"
+                    self.restoreStallAvoidance(because: why, resume: false)
+                    return
+                }
+                if isFirstReading {
+                    isFirstReading = false
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(self.sessionID) early rate evaluation prevented: stall avoidance "
+                        + "off at the first roll for up to \(Int(Self.earlyRateEvaluationWindow))s (buffer ahead "
+                        + ahead + "s)",
+                        category: .engine
+                    )
+                }
+                try? await Task.sleep(for: Self.earlyStallAvoidanceReadingInterval)
+            }
+        }
+    }
+
+    /// Ends the early window. `resume` re-asserts play for a stall that happened with the policy off,
+    /// since that stall can leave the rate at 0.
+    private func restoreStallAvoidance(because reason: String, resume: Bool) {
+        guard earlyStallAvoidanceOff else { return }
+        earlyStallAvoidanceOff = false
+        earlyStallAvoidanceGuard?.cancel()
+        earlyStallAvoidanceGuard = nil
+        avPlayer.automaticallyWaitsToMinimizeStalling = true
+        let since = liveFirstRollAt.map { String(format: "%.2f", Self.secondsSince($0)) } ?? "?"
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sessionID) early rate evaluation window closed, stall avoidance back on at t+"
+            + since + "s after the first roll: " + reason,
+            category: .engine
+        )
+        if resume, playIntent, avPlayer.rate == 0 { avPlayer.play() }
+    }
+
     private func cutEarlyRateEvaluationIfDeep(waitingReason: String) {
         let evaluating = AVPlayer.WaitingReason.evaluatingBufferingRate.rawValue
         guard liveJoinStartsImmediately, playIntent,
@@ -1326,16 +1421,30 @@ final class NativeAVPlayerHost {
               let item = playerItem
         else { return }
         liveEarlyEvaluationProbeInFlight = true
+        let probeStart = DispatchTime.now()
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.liveEarlyEvaluationProbeInFlight = false }
             let reading = await Self.liveJoinBufferReading(item)
-            // The reading is async; most of these waits end inside it, and those need nothing.
+            let since = Self.secondsSince(firstRoll)
+            // The reading is async; most of these waits end inside it, and those need nothing. Say so
+            // once, or a wait the lever reached reads the same as one it never saw (walk 26: 0.74 s).
             guard self.playerItem === item,
                   self.timeControlStatus == .waitingToPlayAtSpecifiedRate,
                   self.avPlayer.reasonForWaitingToPlay?.rawValue == evaluating
-            else { return }
-            let since = Self.secondsSince(firstRoll)
+            else {
+                if self.playerItem === item, !self.liveEarlyEvaluationRaceLogged {
+                    self.liveEarlyEvaluationRaceLogged = true
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(self.sessionID) early rate evaluation ended before its reading "
+                        + "came back (\(String(format: "%.2f", Self.secondsSince(probeStart)))s, t+"
+                        + String(format: "%.2f", since) + "s after the first roll, buffer ahead "
+                        + String(format: "%.2f", reading.aheadSeconds) + "s)",
+                        category: .engine
+                    )
+                }
+                return
+            }
             guard Self.shouldCutEarlyRateEvaluation(
                 armed: self.liveJoinStartsImmediately,
                 hostWantsToPlay: self.playIntent,
@@ -1577,6 +1686,7 @@ final class NativeAVPlayerHost {
 
     func pause() {
         playIntent = false
+        restoreStallAvoidance(because: "the host paused", resume: false)
         avPlayer.pause()
     }
 
@@ -1870,6 +1980,7 @@ final class NativeAVPlayerHost {
     }
 
     private func unloadCurrentItem(inPlaceSwap: Bool = false) {
+        restoreStallAvoidance(because: "the item was unloaded", resume: false)
         if let to = timeObserver {
             avPlayer.removeTimeObserver(to)
             timeObserver = nil
