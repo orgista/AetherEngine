@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import AVKit
 import Combine
+import os
 #if os(tvOS) || os(iOS)
 import MediaPlayer
 #endif
@@ -445,6 +446,9 @@ final class NativeAVPlayerHost {
         self.liveEarlyEvaluationProbeInFlight = false
         self.liveEarlyEvaluationRefusalLogged = false
         self.liveEarlyEvaluationRaceLogged = false
+        // The early window may have turned the policy off from the transport observer of an item that was
+        // unloaded before the main actor saw its roll; every load starts on AVPlayer's own policy.
+        avPlayer.automaticallyWaitsToMinimizeStalling = true
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
@@ -658,8 +662,17 @@ final class NativeAVPlayerHost {
                 self?.cutEarlyRateEvaluationIfDeep(waitingReason: reason)
             }
         }
+        // Turned off here, on the observer's own thread, rather than after the main-actor hop below: the hop
+        // waits behind first-frame work, and DevTV (2026-11-15) saw evaluations begin 0.26 to 0.37 s after the
+        // roll, before the hop ran. The main actor then reads the buffer and keeps or restores the policy.
+        let holdsStallAvoidanceOffEarly = contract.isLive && contract.liveJoinStartsImmediately
+        let firstRollSeen = OSAllocatedUnfairLock(initialState: false)
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
+            if holdsStallAvoidanceOffEarly, status == .playing,
+               firstRollSeen.withLock({ seen in defer { seen = true }; return !seen }) {
+                player.automaticallyWaitsToMinimizeStalling = false
+            }
             let statusStr: String
             switch status {
             case .paused:                          statusStr = "paused"
@@ -1333,30 +1346,41 @@ final class NativeAVPlayerHost {
     /// That reason only exists while `automaticallyWaitsToMinimizeStalling` is on, so the window turns
     /// the policy off instead and puts it back the moment it could matter. It goes off at the roll
     /// (AVPlayer has just judged the item likely to keep up) and stays off only over
-    /// `minimumEarlyEvaluationBufferAhead` of contiguous, non-empty buffer at the first reading, then
-    /// over `minimumLiveJoinBufferAhead` at every later one, inside `earlyRateEvaluationWindow`, while
-    /// the host wants to play. Restoring well before the buffer is empty is what keeps this clear of
+    /// `minimumEarlyHoldBufferAhead` of contiguous buffer at the first reading, then over
+    /// `minimumLiveJoinBufferAhead` at every later one, inside `earlyRateEvaluationWindow`, while the
+    /// host wants to play. Restoring well before the buffer runs out is what keeps this clear of
     /// 35fa16d0's failure: a stall with the policy off is the shape that parks the rate at 0.
+    ///
+    /// Depth decides, not `isPlaybackBufferEmpty`: on DevTV that flag read true with 5.8 s loaded ahead
+    /// in the second after a roll, and handing the policy back on it caused the 0.57 s wait it exists to
+    /// prevent. A stall the depth did not foresee still restores the policy and re-asserts play.
     nonisolated static func shouldHoldStallAvoidanceOff(
         secondsSinceFirstRoll: Double,
         hostWantsToPlay: Bool,
         isFirstReading: Bool,
-        playbackBufferEmpty: Bool,
         bufferedAheadSeconds: Double
     ) -> Bool {
         guard hostWantsToPlay, secondsSinceFirstRoll <= earlyRateEvaluationWindow else { return false }
-        guard !playbackBufferEmpty, bufferedAheadSeconds.isFinite else { return false }
-        let floor = isFirstReading ? minimumEarlyEvaluationBufferAhead : minimumLiveJoinBufferAhead
+        guard bufferedAheadSeconds.isFinite else { return false }
+        let floor = isFirstReading ? minimumEarlyHoldBufferAhead : minimumLiveJoinBufferAhead
         return bufferedAheadSeconds >= floor
     }
+
+    /// The rolls on DevTV read 1.6 to 6 s ahead; a 3 s floor left a third of them on AVPlayer's policy,
+    /// and those were where the remaining waits came from. Two seconds is one segment of these sources and
+    /// still half a second over the floor the window hands back at, which a 250 ms reading interval at
+    /// 1x cannot cross unseen.
+    nonisolated static let minimumEarlyHoldBufferAhead: Double = 2.0
 
     nonisolated static let earlyStallAvoidanceReadingInterval: Duration = .milliseconds(250)
 
     private func holdStallAvoidanceOffAfterFirstRoll() {
         guard liveJoinStartsImmediately, playIntent, !earlyStallAvoidanceOff,
               let firstRoll = liveFirstRollAt, let item = playerItem
-        else { return }
-        avPlayer.automaticallyWaitsToMinimizeStalling = false
+        else {
+            avPlayer.automaticallyWaitsToMinimizeStalling = true
+            return
+        }
         earlyStallAvoidanceOff = true
         earlyStallAvoidanceGuard = Task { @MainActor [weak self] in
             var isFirstReading = true
@@ -1370,7 +1394,6 @@ final class NativeAVPlayerHost {
                     secondsSinceFirstRoll: since,
                     hostWantsToPlay: self.playIntent,
                     isFirstReading: isFirstReading,
-                    playbackBufferEmpty: reading.bufferEmpty,
                     bufferedAheadSeconds: reading.aheadSeconds
                 ) else {
                     let why = since > Self.earlyRateEvaluationWindow

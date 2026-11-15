@@ -43,30 +43,29 @@ struct EarlyRateEvaluationCutTests {
 @Suite("Stall avoidance held off early over a deep live buffer")
 struct EarlyStallAvoidanceWindowTests {
     private func hold(since: Double = 0.3, wantsToPlay: Bool = true, first: Bool = true,
-                      empty: Bool = false, ahead: Double = 5.75) -> Bool {
+                      ahead: Double = 5.75) -> Bool {
         NativeAVPlayerHost.shouldHoldStallAvoidanceOff(
             secondsSinceFirstRoll: since, hostWantsToPlay: wantsToPlay, isFirstReading: first,
-            playbackBufferEmpty: empty, bufferedAheadSeconds: ahead)
+            bufferedAheadSeconds: ahead)
     }
 
-    @Test("the walk-26 shape keeps it off: just rolled, 3.8 to 5.8 s ahead")
+    @Test("the DevTV rolls keep it off: just rolled, 2 to 6 s ahead")
     func deepBufferAtTheRollHoldsItOff() {
         #expect(hold(ahead: 5.75))
-        #expect(hold(ahead: 3.8))
+        #expect(hold(ahead: 2.94))
+        #expect(hold(ahead: 2.0))
     }
 
-    @Test("the first reading needs the deep floor; later readings hand back only below the join floor")
+    @Test("the first reading needs a segment of depth; later readings hand back only below the join floor")
     func floorsHaveHysteresis() {
-        #expect(!hold(first: true, ahead: 2.9))
-        #expect(hold(first: false, ahead: 2.9))
+        #expect(!hold(first: true, ahead: 1.99))
         #expect(hold(first: false, ahead: 1.5))
         #expect(!hold(first: false, ahead: 1.49))
     }
 
-    @Test("AVPlayer's policy comes back after the window, on an empty or unknown buffer, and when the host pauses")
+    @Test("AVPlayer's policy comes back after the window, on an unknown buffer, and when the host pauses")
     func policyComesBack() {
         #expect(!hold(since: 10.01))
-        #expect(!hold(empty: true))
         #expect(!hold(ahead: .nan))
         #expect(!hold(wantsToPlay: false))
     }
