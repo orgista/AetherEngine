@@ -546,8 +546,8 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.markOpenPhaseFinished()
     }
 
-    /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
-    /// 50 MB/60 s ensures codec params are populated without noticeably slowing open.
+    /// Default 5 MB/5s budgets miss streams that resolve late on 10-20 GB Blu-ray rips. Identified
+    /// subtitle tracks no longer spend it (`subtitleNeedsNoProbe`).
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = openProfile.probesize
         ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
@@ -610,9 +610,11 @@ public final class Demuxer: @unchecked Sendable {
             return
         }
         reclassifyAttachedPictures(ctx)
-        let parked = parkUnresolvableAudio(ctx)
+        let parkedAudio = parkUnresolvableAudio(ctx)
+        let parkedSubtitles = parkIdentifiedSubtitles(ctx)
         let findRet = avformat_find_stream_info(ctx, nil)
-        unparkUnresolvableAudio(ctx, parked)
+        restoreCodecType(ctx, parkedAudio, to: AVMEDIA_TYPE_AUDIO)
+        restoreCodecType(ctx, parkedSubtitles, to: AVMEDIA_TYPE_SUBTITLE)
         guard findRet >= 0 else {
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
@@ -692,9 +694,41 @@ public final class Demuxer: @unchecked Sendable {
         return parked
     }
 
-    private func unparkUnresolvableAudio(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int]) {
+    /// Whether `find_stream_info` has nothing to learn about this stream: a subtitle track whose codec
+    /// the container header already named. Every consumer of a subtitle stream needs only `codec_id`
+    /// and `codec_type` (the reasoning behind `subtitleSideDemuxer`), and the bitmap decoders seed
+    /// their canvas from the video size when the codec parameters carry none.
+    ///
+    /// Left in the probe, a PGS track keeps `has_codec_parameters` false ("unspecified size") until
+    /// its first display set is decoded, and on a film that is often tens of seconds in: on a 4K
+    /// remux the pass reads 34-52 MB before giving up (Cheaper by the Dozen, first PGS packet at
+    /// 44 s: 34,037,835 bytes; The Matrix UHD: 52,631,247 bytes, the full budget). Parked, the same
+    /// opens read 4,601 and 150,928 bytes, with every video and audio parameter identical.
+    /// `AV_CODEC_ID_NONE` is a track still being identified, which is what the probe is for.
+    static func subtitleNeedsNoProbe(codecID: AVCodecID, codecType: AVMediaType) -> Bool {
+        codecType == AVMEDIA_TYPE_SUBTITLE && codecID != AV_CODEC_ID_NONE
+    }
+
+    /// Park identified subtitle tracks as ATTACHMENT for the duration of the probe, the same lever
+    /// as `parkUnresolvableAudio`; `restoreCodecType` puts them back, so the track list is unchanged.
+    private func parkIdentifiedSubtitles(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [Int] {
+        var parked: [Int] = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let codecpar = ctx.pointee.streams[i]?.pointee.codecpar,
+                  Self.subtitleNeedsNoProbe(codecID: codecpar.pointee.codec_id,
+                                            codecType: codecpar.pointee.codec_type)
+            else { continue }
+            codecpar.pointee.codec_type = AVMEDIA_TYPE_ATTACHMENT
+            parked.append(i)
+        }
+        return parked
+    }
+
+    /// Undo a park after the pass (see `parkUnresolvableAudio` for why it must follow it).
+    private func restoreCodecType(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int],
+                                  to type: AVMediaType) {
         for i in parked where i < Int(ctx.pointee.nb_streams) {
-            ctx.pointee.streams[i]?.pointee.codecpar?.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+            ctx.pointee.streams[i]?.pointee.codecpar?.pointee.codec_type = type
         }
     }
 

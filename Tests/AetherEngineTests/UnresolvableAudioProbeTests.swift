@@ -125,7 +125,8 @@ struct UnresolvableAudioProbeTests {
 
 /// Counts how far into the source an open had to read. Disc probing is off because its sparse
 /// signature reads seek near the end, and the reach is the whole measurement here.
-private final class CountingReader: IOReader, @unchecked Sendable {
+/// Shared with IdentifiedSubtitleProbeTests.
+final class CountingReader: IOReader, @unchecked Sendable {
     private let data: Data
     private var position = 0
     private var furthest = 0
