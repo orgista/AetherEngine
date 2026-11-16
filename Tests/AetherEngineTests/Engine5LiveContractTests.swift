@@ -324,6 +324,38 @@ struct Engine5LiveContractTests {
         #expect(parked.liveOutageEndlist == false)
     }
 
+    /// Walk 28: a 2.3 s origin read left CITY TV (TARGETDURATION 2) 3.1 s without a new segment while
+    /// the viewer was 38 segments behind. That withdraws the blocking reload, but it must not close the
+    /// window: an item that has seen ENDLIST plays out to a swap and a rebuffer.
+    @Test func aLateSegmentDoesNotCloseTheWindow() {
+        let now = Date()
+        func provider(quietFor quiet: TimeInterval) -> (VideoSegmentProvider, SegmentCache) {
+            let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+            let subject = self.provider(cache: cache)
+            for index in 0..<8 {
+                subject.appendLiveSegment(index: index, startSeconds: Double(index) * 1.5, durationSeconds: 1.5,
+                                          finalizedAt: now.addingTimeInterval(-quiet))
+            }
+            cache.declareTarget(2)
+            // The first build seals TARGETDURATION, which every lateness test reads.
+            _ = HLSLocalServer.buildMediaPlaylistText(provider: subject)
+            return (subject, cache)
+        }
+        let (late, lateCache) = provider(quietFor: 3.2)
+        defer { lateCache.close() }
+        let latePlaylist = HLSLocalServer.buildMediaPlaylistText(provider: late)
+        #expect(target(latePlaylist) == 2)
+        #expect(late.liveDeliveryStalled)
+        #expect(late.liveOutageEndlist == false)
+        #expect(!latePlaylist.contains("#EXT-X-ENDLIST"))
+
+        let (down, downCache) = provider(quietFor: 8.5)
+        defer { downCache.close() }
+        let downPlaylist = HLSLocalServer.buildMediaPlaylistText(provider: down)
+        #expect(down.liveOutageEndlist)
+        #expect(downPlaylist.contains("#EXT-X-ENDLIST"))
+    }
+
     /// AVPlayer sends no segment request while a blocking reload is held, so holding one for the head
     /// while the producer is parked on a full cache starves a consumer with segments resident ahead.
     @Test func blockingReloadIsNotHeldWhileTheProducerIsParked() {

@@ -1744,6 +1744,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     ///
     /// Not for a viewer at the edge: with nothing resident ahead, ENDLIST would only convert a stall into
     /// an end. The gate is the consumer's own fetch point.
+    ///
+    /// Only for a real outage (`liveOutageEndlistLateTargetDurations`): the item that sees ENDLIST plays
+    /// out to a swap, so a late segment must not close it.
     var liveOutageEndlist: Bool {
         let consumerTarget = cache.targetIndex
         stateLock.lock()
@@ -1752,7 +1755,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             return true
         }
         let total = segments.count
-        let stale = sourceIsLateLocked()
+        let stale = sourceIsLateLocked(byTargetDurations: Self.liveOutageEndlistLateTargetDurations)
         stateLock.unlock()
         guard isLive, consumerTarget >= 0, consumerTarget + 1 < total, stale else { return false }
         stateLock.lock()
@@ -1795,11 +1798,24 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// `liveDeliveryStalled`, which latches for the lifetime of the session on purpose (#167: a
     /// returning CAN-BLOCK-RELOAD would flap). A window closed by an outage has to be able to re-open,
     /// so the condition that closes it has to be able to become false again. Call under stateLock.
-    private func sourceIsLateLocked() -> Bool {
+    private func sourceIsLateLocked(byTargetDurations multiple: Double = 1.5) -> Bool {
         guard _liveHeadroomParkedSince == nil, let last = _lastLiveSegmentFinalizedAt,
               let td = liveTargetDurationSeal.value, td > 0 else { return false }
-        return Date().timeIntervalSince(last) > 1.5 * Double(td)
+        return Date().timeIntervalSince(last) > multiple * Double(td)
     }
+
+    /// AE#446 round 6: how late the source must be, in TARGETDURATIONs, before the window is closed.
+    ///
+    /// 1.5 (AVPlayer's own -12888 patience) is right for withdrawing a blocking reload, which costs
+    /// nothing, and wrong for ENDLIST, which costs the viewer a swap and a rebuffer once the runway is
+    /// played out. Walk 28 (DevTV, CITY TV, TARGETDURATION 2): one origin read took 2.3 s, the next
+    /// segment came 3.4 s after the last, the window closed at 3.1 s with the viewer 38 segments
+    /// behind, and 58 s later AVPlayer played to the end and the item was swapped. Across every
+    /// device trace kept since walk 22, 17 of the 23 windows closed this way saw the next segment
+    /// within 2 s of closing; the real outages ran 22 s and more. AVPlayer strikes out on an unchanged
+    /// playlist after about six reloads (24 s on the harness, see `liveOutageEndlist`), so closing at
+    /// 4 still lands before it.
+    static let liveOutageEndlistLateTargetDurations: Double = 4.0
 
     /// AE#446 round 2: the source is delivering again, so the session can go back to being live. Only
     /// an item swap can act on it: an item that has seen ENDLIST never reloads its playlist again,
